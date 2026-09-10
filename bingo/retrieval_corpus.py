@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
-EXCLUDED = {".git", ".bingo", ".pico", ".venv", "venv", "node_modules", "__pycache__",
+EXCLUDED = {".git", ".bingo", ".venv", "venv", "node_modules", "__pycache__",
             ".pytest_cache", ".ruff_cache", ".idea", "dist", "build", "artifacts", "tmp",
             "readme_intro_locked", "coverage", "vendor"}
 EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".c", ".h",

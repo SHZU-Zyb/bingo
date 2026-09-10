@@ -174,7 +174,7 @@ Python 文件获得 AST Symbol 能力。其他语言目前保留源码 Chunk、F
 
 默认排除：
 
-- `.git`、`.bingo`、旧 `.pico`
+- `.git`、`.bingo`
 - `.venv`、`venv`、`node_modules`
 - `__pycache__`、pytest/ruff 缓存
 - `dist`、`build`、`coverage`、`vendor`、`tmp`
