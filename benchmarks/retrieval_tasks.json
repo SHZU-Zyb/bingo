@@ -1,0 +1,10 @@
+[
+  {"query": "authenticate_user", "paths": ["auth.py"], "kind": "symbol"},
+  {"query": "where do we verify login credentials", "paths": ["auth.py"], "kind": "semantic"},
+  {"query": "在哪里检查用户登录凭据", "paths": ["auth.py"], "kind": "cross_language"},
+  {"query": "how is a previous conversation recovered after interruption", "paths": ["session.py"], "kind": "semantic"},
+  {"query": "清理过期缓存的逻辑在哪里", "paths": ["cache.py"], "kind": "cross_language"},
+  {"query": "restore_checkpoint", "paths": ["session.py"], "kind": "symbol"},
+  {"query": "who calls authenticate_user", "paths": ["auth.py"], "kind": "relationship"},
+  {"query": "quantum telescope calibration", "paths": [], "kind": "no_answer"}
+]

@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+uv.lock
+
+# Packaging
+*.egg-info/
+build/
+dist/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+.mini-coding-agent
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local scratch space
+tmp/
+.worktrees/
+.bingo/
+!.bingo/
+.bingo/*
+!.bingo/skills/
+!.bingo/skills/**
+artifacts/
+readme_intro_locked/
+
+# Local secrets and provider configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+secrets.*.json
+.npmrc
+.pypirc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor-local settings
+.idea/
+.vscode/
+
+# Packaging metadata
+bingo.egg-info/

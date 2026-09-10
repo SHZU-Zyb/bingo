@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "repositories": [
+    {
+      "id": "bingo",
+      "path": "..",
+      "expected_revision": "",
+      "queries_file": "real_retrieval/bingo.json",
+      "exclude": ["benchmarks", "docs", "artifacts"]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "repair-diagnostic-gate",
+      "repo_id": "bingo",
+      "category": "mutation-repair",
+      "prompt": "A mutation broke the rule that a passing verification must not start a diagnostic child. Find the defect, apply the smallest fix, and run the focused workflow test.",
+      "allowed_tools": ["list_files", "read_file", "search", "run_shell", "patch_file"],
+      "step_budget": 8,
+      "timeout_seconds": 120,
+      "setup_replacements": [
+        {
+          "path": "bingo/verification_parser.py",
+          "old_text": "if result.get(\"status\") == \"passed\":",
+          "new_text": "if result.get(\"status\") == \"never-pass\":"
+        }
+      ],
+      "expected_paths": ["bingo/verification_parser.py"],
+      "verifier": "{python} -m pytest tests/test_workflows.py::test_runtime_registers_workflow_tools_and_keeps_raw_output_out_of_session -q",
+      "scripted_outputs": [
+        "<tool name=\"patch_file\" path=\"bingo/verification_parser.py\"><old_text>if result.get(\"status\") == \"never-pass\":</old_text><new_text>if result.get(\"status\") == \"passed\":</new_text></tool>",
+        "<final>Restored the passing-result diagnostic gate.</final>"
+      ]
+    },
+    {
+      "id": "repair-parallel-worker-gate",
+      "repo_id": "bingo",
+      "category": "mutation-repair",
+      "prompt": "A mutation allows a parallel workflow to run with one worker. Restore the concurrency boundary and run the focused regression test.",
+      "allowed_tools": ["list_files", "read_file", "search", "run_shell", "patch_file"],
+      "step_budget": 8,
+      "timeout_seconds": 120,
+      "setup_replacements": [
+        {
+          "path": "bingo/workflow_engine.py",
+          "old_text": "if not 2 <= int(max_parallel) <= 4:",
+          "new_text": "if not 1 <= int(max_parallel) <= 4:"
+        }
+      ],
+      "expected_paths": ["bingo/workflow_engine.py"],
+      "verifier": "{python} -m pytest tests/test_workflows.py::test_parallel_workflow_rejects_overlapping_scopes_and_serial_worker_limit -q",
+      "scripted_outputs": [
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"bingo/workflow_engine.py\",\"old_text\":\"if not 1 <= int(max_parallel) <= 4:\",\"new_text\":\"if not 2 <= int(max_parallel) <= 4:\"}}</tool>",
+        "<final>Restored the minimum parallel worker boundary.</final>"
+      ]
+    }
+  ]
+}

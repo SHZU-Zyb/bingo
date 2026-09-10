@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bingo"
+version = "0.1.0"
+description = "Small local coding agent for Ollama, OpenAI-compatible, Anthropic-compatible, and DeepSeek models"
+requires-python = ">=3.10"
+dependencies = ["tzdata; sys_platform == 'win32'", "pathspec>=0.12,<2"]
+
+[project.optional-dependencies]
+rag = ["fastembed>=0.7,<1"]
+ann = ["usearch>=2.26,<3", "numpy>=1.24"]
+
+[project.scripts]
+bingo = "bingo.cli:main"
+bingo-retrieve = "bingo.retrieval_cli:main"
+bingo-benchmark = "bingo.real_benchmark_cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.4.4",
+]
+
+[tool.setuptools]
+packages = ["bingo"]

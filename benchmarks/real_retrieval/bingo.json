@@ -1,0 +1,74 @@
+[
+  {
+    "id": "adaptive-retrieval-route",
+    "query": "where does the system choose direct, symbol, keyword, vector, or hybrid retrieval",
+    "kind": "semantic",
+    "paths": ["bingo/retrieval.py"]
+  },
+  {
+    "id": "ast-symbol-extraction",
+    "query": "parse Python AST into class function and method symbols",
+    "kind": "semantic",
+    "paths": ["bingo/retrieval_corpus.py"]
+  },
+  {
+    "id": "symbol-short-cards",
+    "query": "build bounded identity and behavior cards instead of embedding source bodies",
+    "kind": "semantic",
+    "paths": ["bingo/retrieval_corpus.py"]
+  },
+  {
+    "id": "skill-discovery",
+    "query": "discover SKILL.md metadata without reading the instruction body",
+    "kind": "semantic",
+    "paths": ["bingo/skill_registry.py"]
+  },
+  {
+    "id": "skill-routing",
+    "query": "select a skill by explicit name alias trigger or metadata relevance",
+    "kind": "semantic",
+    "paths": ["bingo/skill_router.py"]
+  },
+  {
+    "id": "skill-lazy-loading",
+    "query": "load selected skill instructions and declared resources on demand",
+    "kind": "semantic",
+    "paths": ["bingo/skill_loader.py"]
+  },
+  {
+    "id": "context-budget",
+    "query": "assemble prompt sections under context budgets without splitting evidence blocks",
+    "kind": "semantic",
+    "paths": ["bingo/context_manager.py"]
+  },
+  {
+    "id": "evidence-freshness",
+    "query": "invalidate cached source evidence when the file hash changes",
+    "kind": "semantic",
+    "paths": ["bingo/evidence_cache.py"]
+  },
+  {
+    "id": "local-test-parser",
+    "query": "parse_verification_output extracts pytest failures before needs_diagnostic_agent",
+    "kind": "qualified-symbol",
+    "paths": ["bingo/verification_parser.py"]
+  },
+  {
+    "id": "parallel-workflow",
+    "query": "WorkflowEngine.run_parallel uses ThreadPoolExecutor for independent branches",
+    "kind": "qualified-symbol",
+    "paths": ["bingo/workflow_engine.py"]
+  },
+  {
+    "id": "checkpoint-resume",
+    "query": "evaluate_resume_state detects checkpoint freshness and workspace mismatch",
+    "kind": "qualified-symbol",
+    "paths": ["bingo/runtime.py"]
+  },
+  {
+    "id": "negative-quantum",
+    "query": "quantum telescope calibration controller",
+    "kind": "negative",
+    "paths": []
+  }
+]

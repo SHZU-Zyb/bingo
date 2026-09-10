@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic multi-turn context and completion benchmark for Bingo.",
+  "tasks": [
+    {
+      "id": "remember_sample_sequence",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file"],
+      "total_step_budget": 4,
+      "turns": [
+        {
+          "id": "read-and-remember",
+          "user": "Read sample.txt and remember its first three values.",
+          "answer_contains": ["Remembered"]
+        },
+        {
+          "id": "recall-without-reread",
+          "user": "Without rereading sample.txt, tell me the remembered sample sequence.",
+          "answer_contains": ["alpha", "beta", "gamma"],
+          "required_context": [
+            {
+              "id": "sample_sequence",
+              "text": "1: alpha | 2: beta | 3: gamma"
+            }
+          ]
+        }
+      ],
+      "final_verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'alpha\\nbeta\\ngamma' in text\"",
+      "scripted_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"sample.txt\",\"start\":1,\"end\":4}}</tool>",
+        "<final>Remembered.</final>",
+        "<final>The remembered sequence is alpha, beta, gamma.</final>"
+      ]
+    }
+  ]
+}
