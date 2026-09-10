@@ -11,8 +11,6 @@ Bingo 是一个直接运行在代码仓库中的本地智能 Agent。它能够�
 
 项目关注的不只是“让模型调用工具”，还包括检索质量、上下文成本、执行边界和可复现评测：源码位置与向量语义分离，Skill 按需加载，子 Agent 只在并行调查或复杂诊断确实有收益时启动，所有关键过程均可通过 Session、Trace 和 Report 回溯。
 
-![Bingo REPL](assets/screenshots/bingo-repl.png)
-
 ## 为什么做 Bingo
 
 常见 Coding Agent 原型容易遇到几个问题：
