@@ -23,7 +23,12 @@ def _clip(value, limit):
 
 def _tool_details(name, args):
     args = dict(args or {})
-    if name in {"read_file", "write_file", "patch_file", "list_files"}:
+    if name == "read_file":
+        path = _clip(args.get("path", "."), 100)
+        start = int(args.get("start", 1) or 1)
+        end = int(args.get("end", 200) or 200)
+        return f"path={path} lines={start}-{end}"
+    if name in {"write_file", "patch_file", "list_files"}:
         path = _clip(args.get("path", "."), 100)
         return f"path={path}"
     if name == "search":
@@ -45,7 +50,7 @@ def _duration_ms(event):
 
 
 class ConsoleProgressRenderer:
-    def __init__(self, stream=None, max_steps=6):
+    def __init__(self, stream=None, max_steps=12):
         self.stream = stream if stream is not None else sys.stderr
         self.max_steps = int(max_steps)
         self.attempt = 0
@@ -80,6 +85,12 @@ class ConsoleProgressRenderer:
             status = str(event.get("tool_status", "ok") or "ok")
             duration = _duration_ms(event)
             if status == "ok":
+                if event.get("read_cache_action") == "trimmed":
+                    skipped = _single_line(event.get("skipped_cached_range", ""))
+                    effective_args = dict(event.get("effective_args", {}) or {})
+                    start = int(effective_args.get("start", 1) or 1)
+                    end = int(effective_args.get("end", 200) or 200)
+                    return [f"{self.marker()} ok{duration} cached={skipped} read={start}-{end}"]
                 return [f"{self.marker()} ok{duration}"]
             display_status = "partial" if status == "partial_success" else status
             error_code = str(event.get("tool_error_code", "")).strip()

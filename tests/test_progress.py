@@ -46,7 +46,7 @@ def test_renderer_shows_attempt_tool_start_and_success():
     output = stream.getvalue()
     assert "[run] started" in output
     assert "[1/24] thinking..." in output
-    assert "[1/24] tool read_file path=tests/test_demo.py" in output
+    assert "[1/24] tool read_file path=tests/test_demo.py lines=1-80" in output
     assert "[1/24] ok 15ms" in output
     assert "def test_demo" not in output
 
@@ -80,6 +80,24 @@ def test_renderer_shows_concise_shell_failure():
     assert "error tool_failed" in lines[2]
     assert "exit_code: 1" in lines[2]
     assert len(lines[2]) < 220
+
+
+def test_renderer_shows_when_a_read_skips_cached_lines():
+    stream = StringIO()
+    renderer = ConsoleProgressRenderer(stream=stream, max_steps=12)
+    renderer({"event": "model_requested", "attempts": 2, "tool_steps": 1})
+    renderer(
+        {
+            "event": "tool_executed",
+            "name": "read_file",
+            "tool_status": "ok",
+            "read_cache_action": "trimmed",
+            "skipped_cached_range": "1-78",
+            "effective_args": {"path": "bingo/embeddings.py", "start": 79, "end": 120},
+        }
+    )
+
+    assert stream.getvalue().splitlines()[-1] == "[2/12] ok cached=1-78 read=79-120"
 
 
 def test_renderer_only_shows_recovery_checkpoints():

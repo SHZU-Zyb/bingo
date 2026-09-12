@@ -1,700 +1,1319 @@
-# Bingo 项目面试讲解总结
+# Bingo 项目面试深挖手册
 
-这份文档用于日常复习和面试前梳理。目标不是死背文件名，而是能把这个项目讲成一个完整、内行、流畅的工程故事。
+> 适用版本：当前仓库源码
+> 最近核验：2026-09-11
+> 用途：项目介绍、技术追问、系统设计讨论、现场演示与简历数据解释
 
-## 1. 项目一句话定位
+这份文档以当前实现为准。面试时不要背模块清单，要围绕四个问题展开：系统解决了什么问题，为什么这样设计，关键边界如何保证，数据是否支持结论。
 
-`bingo` 是一个运行在本地代码仓库里的轻量级 Coding Agent。它不是普通聊天机器人，而是在大模型外面实现了一层可控 runtime：每一轮先采集 workspace 状态和历史上下文，组装 prompt，然后让模型在受限工具集中选择动作；工具执行结果会写回 session history、working memory、checkpoint 和 trace，下一轮模型再基于最新上下文继续决策。
+---
 
-面试开场可以这样说：
+## 1. 项目定位
 
-> 我这个项目实现的是一个本地 coding agent harness。它围绕大模型做了一层可控的 runtime：每一轮先采集 workspace 状态和历史上下文，组装 prompt，然后让模型在受限工具集中选择动作；工具执行结果会写回 session history、working memory、checkpoint 和 trace，下一轮模型再基于最新上下文继续决策。整个系统强调可恢复、可审计、可测试和安全边界。
+### 1.1 一句话介绍
 
-## 2. 整体架构
+Bingo 是一个运行在本地代码仓库中的 Coding Agent Runtime。它围绕大模型实现了可控的执行循环，并通过自适应代码检索、AST Symbol Graph、分层上下文、按需 Skill 和有门控的多 Agent Workflow，在检索质量、上下文成本、执行安全与可复现评测之间做工程化平衡。
 
-核心模块在 `bingo-main/bingo` 下：
+### 1.2 30 秒介绍
 
-- `cli.py`：命令行入口，解析参数，构建 agent。
-- `runtime.py`：Agent 主循环，整个系统的核心控制器。
-- `context_manager.py`：prompt 组装与上下文预算控制。
-- `memory.py`：工作记忆、文件摘要、相关记忆召回、长期记忆。
-- `workspace.py`：仓库快照、git 状态、项目文档摘要。
-- `tools.py`：工具注册、参数校验、工具执行。
-- `models.py`：不同模型后端适配层。
-- `task_state.py`：单次任务状态机。
-- `run_store.py`：运行产物落盘。
-- `evaluator.py`：benchmark harness。
-- `metrics.py`：实验指标、消融实验、报告生成。
+> 我做的是一个面向真实代码仓库的本地 Coding Agent。模型只负责需要语义理解和推理的部分，Runtime 负责 Prompt 组装、工具校验、执行、状态恢复和审计。代码检索会根据仓库规模、查询类型和上下文预算，在直接加载、Symbol、BM25、向量和 Hybrid 之间自适应选择；向量库只存 Symbol 短卡，命中后再按哈希读取源码。Skill 只在匹配后加载，多 Agent 也只在跨模块并行调查或复杂诊断确实有收益时启用。项目有 218 个通过的自动化测试，并保留真实仓库检索的负向消融结果。
 
-整体数据流：
+### 1.3 2 分钟介绍
 
-```text
-CLI
- ↓
-Bingo Runtime
- ↓
-ContextManager  ← WorkspaceContext
- ↓               ← LayeredMemory
-ModelClient
- ↓
-parse model output
- ↓
-Tool Registry
- ↓
-Workspace / Shell / File operations
- ↓
-History + Memory + Checkpoint + Trace + Report
-```
+> 这个项目的核心不是简单地调用一次大模型 API，而是实现一个 Agent Harness。每次用户请求都会进入一个有步数上限的控制循环：先路由 Skill 和上下文，再组装稳定前缀、工作状态、相关记忆、检索候选、源码证据和历史，调用模型后解析成单个工具动作或最终回答。工具执行前会经过 schema、路径、权限和审批校验，结果再写入 Session、TaskState、Trace、Report、Memory 或 Evidence Cache。
+>
+> 检索方面，我没有对所有仓库盲目使用 RAG。小仓库概览或明确文件且内容能装入预算时直接加载；精确标识符和调用关系优先走 Symbol 与 BM25；语义查询先做便宜的一阶段检索，证据不足才升级到 Hybrid。Python 文件通过 AST 提取类、函数、方法、嵌套函数、签名、父子关系、调用和继承关系。Embedding 的对象不是完整代码正文，而是每个 Symbol 最多两张 1,200 字符的 identity/behavior 短卡，命中后用 symbol_id、行号和文件哈希读取当前源码。
+>
+> 为避免上下文重复，我把 Memory、Retrieval Candidate 和 Source Evidence 分开：Memory 只保存跨轮次有价值的状态与决策；检索候选只回答可能读哪里；Source Evidence 保存已经实际读取并通过哈希校验的源码。Skill 和多 Agent 也采用按需策略。测试执行先由本地进程完成，标准错误用正则提取，只有多失败、跨模块或非结构化错误才调用诊断子 Agent。完整日志无损落盘，父 Agent 只接收有界的结构化摘要和引用。
 
-## 3. 启动流程
+### 1.4 面试时最值得强调的三个点
 
-项目从 `cli.py` 的 `build_agent()` 开始。
+1. **自适应而不是固定 RAG**：通过仓库规模、查询类型、路径范围、证据充分度和预算选择检索策略。
+2. **位置检索与源码阅读分离**：Embedding 负责召回，哈希校验后的工具负责提供事实证据。
+3. **确定性逻辑优先于模型调用**：权限检查、路径约束、测试解析、去重、预算、持久化均由本地代码控制。
 
-启动时主要做几件事：
+---
 
-1. 构建 `WorkspaceContext`
-   读取当前目录、git root、分支、git status、最近 commit，以及 `README.md`、`pyproject.toml`、`package.json`、`AGENTS.md` 这类项目文档。
+## 2. 问题背景与设计目标
 
-2. 加载 `.env`
-   模型 API key、base url、model name 通过环境变量配置。
+普通 Agent 原型常见以下问题：
 
-3. 构建模型客户端
-   支持 Ollama、OpenAI-compatible、Anthropic-compatible、DeepSeek。
+| 问题 | 直接后果 | Bingo 的处理 |
+|---|---|---|
+| 启动就读取整个仓库 | 小仓库浪费，大仓库爆上下文 | 按规模与范围选择 Direct 或检索 |
+| 所有查询都走向量库 | 精确符号查询变慢且不稳定 | Symbol/BM25 优先，弱证据再升级 |
+| Embedding 完整源码 | 长正文稀释语义，索引成本高 | 每个 Symbol 两张短语义卡 |
+| 检索结果直接当事实 | 索引可能过期 | symbol_id + SHA-256 二阶段读取 |
+| Memory 与代码检索混用 | 同一源码重复进入 Prompt | 工作状态、相关记忆、候选、证据分层 |
+| 所有任务都创建子 Agent | 调用成本高，整合复杂 | 父 Agent、本地算法、子 Agent 三层门控 |
+| 测试日志全部交给模型 | 上下文膨胀 | 本地正则提取，原始日志无损落盘 |
+| 模型直接操作系统 | 路径逃逸、误写、命令风险 | 工具白名单、参数校验、审批和只读子 Agent |
+| 只展示成功样例 | 无法判断真实工程效果 | 固定清单、Verifier、Trace、消融和失败报告 |
 
-4. 创建或恢复 session
-   如果传了 `--resume`，从 `.bingo/sessions/<session_id>.json` 恢复；否则新建 session。
+设计目标不是追求“模型调用最多”，而是让每次模型调用处理本地算法难以可靠完成的部分。
 
-5. 初始化 `Bingo`
-   初始化 memory、tools、prefix、context manager、resume state。
+---
 
-面试说法：
+## 3. 总体架构
 
-> CLI 层只负责把外部参数翻译成 runtime 需要的对象，真正的 agent 状态都集中在 `Bingo` 实例里，包括 workspace、session、memory、tools、model client 和 context manager。
-
-## 4. Bingo Runtime 主循环
-
-项目最核心的是 `runtime.py` 的 `Bingo.ask()`。
-
-它是一个 ReAct 风格循环：
+### 3.1 分层视图
 
 ```text
-用户输入
- ↓
-记录到 session history
- ↓
-构建 prompt
- ↓
-请求模型
- ↓
-解析模型输出
- ↓
-如果是 tool call：执行工具、记录结果、更新记忆、创建 checkpoint
- ↓
-如果是 final answer：结束任务、写 report
+Interface Layer
+  CLI / REPL / one-shot command
+          |
+Control Layer
+  Bingo Runtime / TaskState / stopping rules / approval
+          |
+Context Layer
+  Context Router / Context Manager / Prompt Cache
+          |
+Knowledge Layer
+  Adaptive Retrieval / Symbol Graph / Memory / Evidence Cache / Skills
+          |
+Execution Layer
+  File Tools / Shell / Workflow Engine / Read-only Child Agents
+          |
+Observability Layer
+  Session / Checkpoint / Trace / Report / Benchmark Artifacts
 ```
 
-模型每次只能输出两种东西：
+### 3.2 运行链路
 
-```xml
-<tool>...</tool>
+```mermaid
+flowchart TD
+    U[User Request] --> SR[Skill Router]
+    U --> CR[Context Router]
+    CR --> M[Relevant Memory]
+    CR --> R[Adaptive Retrieval]
+    R --> D[Direct]
+    R --> S[Symbol + BM25]
+    R --> H[Hybrid + Graph]
+    S --> C[Location Candidates]
+    H --> C
+    C --> E[Hash-checked Source Evidence]
+    SR --> L[Lazy Skill Loader]
+    M --> CM[Context Manager]
+    D --> CM
+    C --> CM
+    E --> CM
+    L --> CM
+    CM --> P[Parent Agent]
+    P --> V[Tool Validation and Approval]
+    V --> T[Local Tools]
+    V --> W[Workflow Gate]
+    W --> PA[Parallel Read-only Agents]
+    W --> LA[Local Verification Parser]
+    LA -->|ambiguous failure| DA[Diagnostic Agent]
+    T --> O[Session / Trace / Report]
+    PA --> O
+    LA --> O
+    DA --> O
 ```
 
-或者：
+### 3.3 核心模块
 
-```xml
-<final>...</final>
-```
+| 模块 | 主要职责 | 面试切入点 |
+|---|---|---|
+| `bingo/cli.py` | 参数解析、Provider 选择、Agent 构建 | 外部配置与 Runtime 解耦 |
+| `bingo/runtime.py` | 主循环、停止条件、工具调度、状态更新 | Agent Harness 核心 |
+| `bingo/context_manager.py` | 分区预算、压缩、Prompt 装配 | 控制上下文成本 |
+| `bingo/context_router.py` | 判断是否需要代码检索和记忆召回 | 可解释的轻量路由 |
+| `bingo/retrieval_corpus.py` | 文件枚举、Chunk、AST、Symbol Graph、SQLite 索引 | 检索语料层 |
+| `bingo/retrieval.py` | Direct/Symbol/BM25/Vector/Hybrid 路由与融合 | 自适应检索核心 |
+| `bingo/evidence_cache.py` | 已读源码缓存、哈希新鲜度、LRU | 候选与事实证据分离 |
+| `bingo/memory.py` | 工作状态、过程笔记、持久决策 | Memory 的职责边界 |
+| `bingo/skill_registry.py` | 只扫描 Skill 元数据 | 延迟加载第一阶段 |
+| `bingo/skill_router.py` | 显式、alias、trigger 和元数据相关性路由 | 无匹配不强选 |
+| `bingo/skill_loader.py` | 正文、资源加载与哈希复用 | 延迟加载第二阶段 |
+| `bingo/workflow_engine.py` | 并行调查、验证和诊断门控 | 多 Agent 有界使用 |
+| `bingo/verification_parser.py` | 本地解析测试计数和失败卡片 | 本地算法优先 |
+| `bingo/workflow_store.py` | 无损工件和有界回读 | 防止摘要丢失信息 |
+| `bingo/models.py` | 多 Provider 适配、重试、usage、clone | 模型后端隔离 |
+| `bingo/tools.py` | 工具 schema、验证、执行函数 | 能力白名单与安全边界 |
+| `bingo/task_state.py` | 单次请求状态机 | attempts 与 tool_steps 分离 |
+| `bingo/run_store.py` | TaskState、Trace、Report 原子落盘 | 可恢复与可审计 |
+| `bingo/real_benchmark.py` | 真实仓库 E2E、检索消融和报告 | 数据可信度 |
 
-这样 runtime 可以可靠判断下一步是执行工具还是返回最终答案。
+---
 
-面试可以这样讲：
+## 4. Runtime：模型外面的确定性控制层
 
-> 我没有让模型自由输出自然语言后由人猜，而是定义了一个很小的协议：模型每轮只能返回一个工具调用或者最终答案。runtime 会解析模型输出，然后进入工具执行、安全校验、结果回写这一套确定性流程。
+### 4.1 为什么需要 Runtime
 
-## 5. 上下文处理
+大模型擅长理解意图和推理，但不适合独自保证以下事情：
 
-上下文处理主要在 `context_manager.py`。
+- 每次只执行一个合法动作；
+- 文件路径不能逃出工作区；
+- 写操作是否需要审批；
+- 工具调用是否重复；
+- 何时因步数、重试或错误停止；
+- 哪些状态需要持久化；
+- 检索证据是否已经过期；
+- 测试成功是否真的由命令退出码证明。
 
-每轮真正发给模型的 prompt 由五部分组成：
+因此 Runtime 把模型输出当作“不可信的动作建议”，经过解析和校验后才执行。
+
+### 4.2 `Bingo.ask()` 主循环
 
 ```text
-prefix
-memory
-relevant_memory
-history
-current_request
+activate Skills
+  -> update task summary
+  -> create TaskState and run directory
+  -> build Prompt
+  -> model.complete()
+  -> parse one tool call or final answer
+  -> validate tool
+  -> approval/read-only/allowlist check
+  -> execute
+  -> update History, Memory, Evidence Cache, Checkpoint and Trace
+  -> next model step
 ```
 
-五部分分别是：
+关键限制：
 
-- `prefix`：稳定前缀，包括 agent 身份、规则、工具列表、工具调用格式、workspace 快照。
-- `memory`：轻量工作记忆，比如当前任务摘要、最近访问文件、文件摘要、episodic note 数量、durable memory topic。
-- `relevant_memory`：根据当前用户请求，从短期笔记和长期记忆里召回最相关的 3 条。
-- `history`：会话历史，但不是无限塞入，会对旧历史做压缩。
-- `current_request`：当前用户请求，永远放在最后，而且不会裁剪。
+- 默认 `max_steps=6`；
+- 最大模型尝试次数为 `max(max_steps * 3, max_steps + 4)`；
+- `attempts` 统计模型调用轮次；
+- `tool_steps` 只统计真正进入执行阶段的工具调用；
+- 最终停止原因单独记录，如正常回答、步数耗尽、重试耗尽、模型错误或审批拒绝。
 
-面试重点：
+### 4.3 为什么区分 attempts 和 tool_steps
 
-> 这个项目不是简单拼接聊天记录，而是把上下文分层管理。稳定信息、工作记忆、相关召回、历史记录和当前请求分别有自己的预算和裁剪策略，这样可以让 prompt 可控、可解释，也方便做实验和审计。
+模型可能输出无法解析的内容，Runtime 会要求重试，但这次没有真正执行工具。如果只记录一个 step，就无法区分“模型协议失败”和“工具链执行过多”。分开记录后，评测可以判断问题来自模型输出稳定性还是 Agent 行动效率。
 
-## 6. 上下文预算与压缩策略
+### 4.4 模型输出协议
 
-默认总预算：
+模型每轮只能返回一个工具调用或最终回答。工具调用采用结构化 JSON/XML 包装，由 Runtime 解析；解析失败不会直接执行自然语言中的命令。
+
+这样做的价值：
+
+- 动作边界明确；
+- 参数可以做类型和范围校验；
+- Trace 可以稳定记录；
+- 测试可以覆盖错误协议；
+- 模型无法通过普通文本绕过工具系统。
+
+### 4.5 状态与工件
+
+```text
+.bingo/
+├── sessions/<session_id>.json
+├── runs/<run_id>/
+│   ├── task_state.json
+│   ├── trace.jsonl
+│   ├── report.json
+│   └── workflows/
+├── memory/
+└── retrieval/index.sqlite3
+```
+
+- **Session**：用于跨轮次恢复，保存 History、Memory、Skill 加载状态、Evidence Cache 和 Checkpoint 索引。
+- **TaskState**：描述一次 `ask()` 当前走到哪里。
+- **Trace**：按事件追加 JSONL，适合流式写入和故障定位。
+- **Report**：运行结束后的汇总。
+- **Workflow Artifact**：保存完整 stdout、stderr 和子 Agent 原始结果。
+
+RunStore 对 JSON 采用“临时文件写入后 replace”的原子写方式，避免进程中断留下半截状态。
+
+---
+
+## 5. 自适应检索
+
+### 5.1 自适应的决策变量
+
+检索入口是 `RetrievalEngine.search()`，主要观察：
+
+1. **仓库规模**：按 Chunk 数分为 small、medium、large；
+2. **查询类型**：关系、限定符号、标识符、位置或语义；
+3. **路径范围**：用户是否明确指定文件或目录；
+4. **上下文预算**：范围内完整内容能否装入；
+5. **一阶段证据强度**：Symbol 与 BM25 是否已经共同覆盖主要查询词；
+6. **向量后端状态**：是否配置、是否可用、覆盖率是否完整；
+7. **ANN 质量**：大仓库 HNSW 结果相似度不足时是否回退精确余弦。
+
+默认规模阈值：
+
+| 档位 | Chunk 数 |
+|---|---:|
+| small | `≤ 200` |
+| medium | `201～5000` |
+| large | `> 5000` |
+
+这些是可通过环境变量调整的工程默认值，不是理论上唯一正确的分界。
+
+### 5.2 查询分类
+
+| query_type | 典型输入 | 主要策略 |
+|---|---|---|
+| `qualified_symbol` | `ContextManager.build` | 精确 Symbol |
+| `identifier` | `pack_hits` | Symbol + BM25 |
+| `relationship` | “谁调用了 pack_hits” | Symbol + 一跳 Graph |
+| `location` | `bingo/runtime.py` | 范围直接加载或关键词 |
+| `semantic` | “哪里处理过期源码证据” | 便宜检索，弱证据升级 Hybrid |
+
+当前分类由确定性正则完成，优点是快、可解释、可测试；缺点是复杂自然语言可能分类不准，这也是 Auto 指标仍需优化的原因之一。
+
+### 5.3 Auto 路由逻辑
+
+```text
+明确文件/目录且内容可装入，或小仓库概览
+  -> Direct
+
+精确 Symbol
+  -> Symbol
+
+调用/继承关系
+  -> Symbol + Graph
+
+单个标识符
+  -> Symbol + BM25
+
+一般语义查询
+  -> Symbol + BM25 first pass
+       |
+       +-- 证据充分 -> Keyword 路径结束
+       |
+       +-- 证据不足 -> Hybrid(Symbol + BM25 + Vector)
+```
+
+这体现“便宜路径优先、证据不足再升级”。如果 Embedding 未配置或调用失败，Hybrid 自动降级到 Keyword，并通过 `fallback_reason` 记录原因。
+
+### 5.4 为什么保留 Direct
+
+RAG 不是目的。对于一个几十个 Chunk 的仓库，建立向量索引和进行召回可能比直接读取更慢，还会丢失全局结构。当指定文件、指定目录，或小仓库概览范围能完整装入预算时，Direct 能提供无召回损失的上下文。
+
+### 5.5 Symbol、BM25、Vector 和 Graph 各自解决什么问题
+
+| 通道 | 擅长场景 | 主要缺点 |
+|---|---|---|
+| Symbol | 精确函数名、方法名、签名 | 不理解自然语言语义 |
+| BM25/FTS5 | 错误字符串、关键字、路径、标识符 | 跨语言或同义表达弱 |
+| Vector | 自然语言描述、中文到英文代码语义 | 排名可能被相似但不关键的概念干扰 |
+| Graph | 调用、包含、继承邻居 | 静态解析不等于运行时真实调用 |
+| Direct | 小范围完整事实 | 范围大时占用上下文 |
+
+### 5.6 Hybrid 融合
+
+各通道先独立排序，再使用带通道权重的 Reciprocal Rank Fusion：
+
+```text
+score(d) = Σ channel_weight / (60 + rank_channel(d))
+```
+
+当前权重大致为：
+
+- Symbol：1.2；
+- Keyword：1.0；
+- Vector：0.9；
+- 关系查询追加 Graph：0.8。
+
+RRF 不要求把 BM25 分数、余弦相似度和图置信度强行归一到同一数值空间，工程上更稳定。精确 qualified name 还会在最终排序中获得优先位置。
+
+### 5.7 去重与结果多样性
+
+融合后继续做以下处理：
+
+- 同一通道内按 symbol_id 去重；
+- 相同源码正文按 SHA-256 合并，并保留多个来源位置；
+- 单文件最多保留 4 个结果；
+- 同一父 Symbol 最多保留 3 个结果；
+- Graph 默认只扩展一跳，fan-out 最大 8；
+- 整个候选卡必须完整装入预算，绝不从中间截断一张卡；
+- 返回前重新读取文件并核对 hash，过期候选计入 `stale_candidates` 后丢弃。
+
+### 5.8 大仓库策略
+
+大仓库根范围检索可以使用可选的 USearch HNSW：
+
+- 索引构建参数固定；
+- ANN 只用于 large tier；
+- 最佳相似度低于默认 `0.55` 时回退精确余弦；
+- 未安装、维度变化或运行异常均有显式 fallback；
+- 精确余弦使用有界 top-k heap，不需要一次排序所有结果。
+
+它支持规模扩展，但当前真实评测还没有覆盖足够多的大仓库，因此面试时应说“实现了大仓库路径和回退机制”，不要说“已经证明大仓库性能领先”。
+
+---
+
+## 6. AST Symbol Graph 与短卡 Embedding
+
+### 6.1 Symbol 包含什么
+
+Python AST 会提取：
+
+- `class`；
+- 顶层 `function`；
+- 类内 `method`；
+- `nested_function`；
+- qualified name 和 simple name；
+- 父 Symbol；
+- 签名与 Docstring；
+- 起止行号和文件 SHA-256；
+- 有界的 calls、attributes、literals、returns、bases；
+- contains、calls、inherits 边。
+
+Symbol ID 使用 `path + qualified_name + kind` 的 SHA-256，因此同一文件同一符号的 ID 稳定；源码是否变化由独立的 `content_hash` 判断。
+
+### 6.2 一个具体例子
+
+假设源码：
 
 ```python
-DEFAULT_TOTAL_BUDGET = 12000
+class SessionService(BaseService):
+    """恢复并校验会话。"""
+
+    def resume(self, session_id: str):
+        data = self.store.load(session_id)
+        return self.validator.check(data)
 ```
 
-默认分区预算：
+Symbol 表会包含两条记录：
 
 ```text
-prefix: 3600
-memory: 1600
-relevant_memory: 1200
-history: 5200
+SessionService
+  kind=class
+  parent=""
+  signature=SessionService(BaseService)
+  bases=[BaseService]
+  lines=1..6
+
+SessionService.resume
+  kind=method
+  parent=SessionService
+  signature=resume(self, session_id: str)
+  calls=[self.store.load, self.validator.check]
+  attributes=[self.store.load, self.store, self.validator.check, self.validator]
+  returns=[return self.validator.check]
+  lines=4..6
 ```
 
-如果超预算，会按这个顺序压缩：
+Graph 可能包含：
 
 ```text
-relevant_memory -> history -> memory -> prefix
+SessionService --contains--> SessionService.resume
+SessionService --inherits--> BaseService       # 仅当目标可唯一解析
+SessionService.resume --calls--> 某目标         # 仅当名称可唯一解析
 ```
 
-但 `current_request` 不裁剪。
+### 6.3 哪些内容进入 Embedding
 
-面试说法：
-
-> 我们优先保留当前请求和 agent 规则，因为这是本轮决策最关键的部分。旧的相关记忆和历史可以被压缩，但当前请求必须完整保留，避免模型误解用户最新意图。
-
-历史压缩策略：
-
-- 最近 6 条历史尽量保留。
-- 老的重复 `read_file` 会折叠。
-- 老的文件读取可以复用 `file_summary`。
-- 老的 `run_shell` 只保留前三行摘要。
-
-所以它不是粗暴截断，而是带语义的压缩。
-
-## 7. Memory 设计
-
-记忆系统在 `memory.py`。
-
-默认 memory 结构：
-
-```python
-{
-    "working": {
-        "task_summary": "",
-        "recent_files": [],
-    },
-    "episodic_notes": [],
-    "file_summaries": {},
-    "task": "",
-    "files": [],
-    "notes": [],
-    "next_note_index": 0,
-}
-```
-
-可以分成四层：
-
-1. Working memory
-   当前任务摘要、最近文件。
-
-2. Episodic notes
-   每次读文件或工具异常后沉淀的小笔记。
-
-3. File summaries
-   文件摘要，并带 freshness hash，防止文件变了摘要还被误用。
-
-4. Durable memory
-   长期记忆，保存在 `.bingo/memory` 下，比如项目约定、关键决策、依赖事实、用户偏好。
-
-读文件之后，`update_memory_after_tool()` 会做：
+每个 Symbol 最多生成两张卡：
 
 ```text
-remember_file
-set_file_summary
-append_note
+identity card
+  kind
+  qualified_name
+  parent
+  signature
+  module
+
+behavior card
+  qualified_name
+  purpose/docstring
+  calls
+  attributes
+  bounded literals
+  returns
 ```
 
-写文件或 patch 文件后，会让旧摘要失效：
+边界如下：
+
+| 字段 | 上限 |
+|---|---:|
+| signature | 160 字符 |
+| docstring | 240 字符 |
+| calls | 12 项 |
+| attributes | 10 项 |
+| literals | 6 项 |
+| 单张卡 | 1,200 字符 |
+
+完整源码、行号、文件 hash、密钥形态字符串以及无界方法体不进入 Embedding。数据库仍保存源码 Chunk 供 BM25 和定位使用，但旧的完整 Chunk 向量表会在迁移时清空。
+
+### 6.4 为什么不是只存位置、完全不用代码语义
+
+只保存位置能让模型在候选产生后读取源码，但仍需要一个机制从成千上万个位置中找出候选。精确符号和 BM25 能解决一部分问题，中文自然语言与英文实现、同义描述和跨模块概念查询则需要语义召回。
+
+因此这里采用折中方案：
+
+- 向量只编码短小、稳定、可解释的 Symbol 语义；
+- 位置和 hash 作为 metadata；
+- 真正用于修改判断的源码通过工具按需读取。
+
+Embedding 用来“找位置”，源码工具用来“建立事实”。
+
+### 6.5 Graph 的保守边界
+
+静态 AST 无法准确还原动态分派、依赖注入、反射、猴子补丁和运行时生成代码。当前实现只解析：
+
+- 同文件可唯一确定的目标；
+- 全库 simple name 唯一的目标；
+- `self.x`、`cls.x` 可映射到当前类成员的目标。
+
+有歧义就不连边。面试时应称它为“高精度、有限召回的一跳静态 Symbol Graph”，不能把它说成完整调用图。
+
+### 6.6 非 Python 文件怎么办
+
+非 Python 文件仍会进入文件枚举、Chunk 和 FTS5 关键词索引，也能 Direct 读取；当前 AST Symbol 抽取仅支持 Python。这是明确的实现边界。扩展方向是为 TypeScript、Java、Go 等语言接入 Tree-sitter，并复用统一 Symbol Schema。
+
+---
+
+## 7. Context、Memory 与 Source Evidence
+
+### 7.1 三者的职责
+
+| 数据 | 回答的问题 | 生命周期 | 是否含源码正文 |
+|---|---|---|---:|
+| Working State | 当前任务在做什么、最近碰过哪些文件 | 当前会话 | 否 |
+| Relevant Memory | 以前有哪些决定、偏好或稳定事实与本轮相关 | 跨轮次/可持久 | 原则上否 |
+| Retrieval Candidate | 这轮可能应该读取哪些位置 | 当前检索 | 否，Direct 例外 |
+| Source Evidence | 哪些源码已经真实读取且仍然新鲜 | 当前会话缓存 | 是 |
+| Transcript | 模型和工具刚刚做了什么 | 当前会话 | 可能包含压缩结果 |
+| Skill | 该类任务应该采用什么流程 | 当前请求激活 | 指令和按需资源 |
+
+最关键的边界是：**Memory 不承担代码正文缓存，Evidence Cache 不承担长期知识记忆。**
+
+### 7.2 Memory 的实际作用
+
+Memory 保存的是未来轮次仍有价值的信息：
+
+- 当前任务摘要；
+- 最近访问文件名；
+- 有界的 episodic/process note；
+- 文件摘要及 freshness；
+- 长期项目约定；
+- 关键决策；
+- 依赖事实；
+- 用户偏好。
+
+Working State 渲染时只展示 recent files、笔记数量和 durable topic，不把全部笔记正文铺开。只有查询与某条记忆发生 token/tag 命中时，才在 Relevant Memory 中最多召回 3 条。
+
+### 7.3 Relevant Memory 是否与代码检索重复
+
+经过当前优化后，代码派生笔记会从 Relevant Memory 候选中过滤。源码的位置和正文由 Retrieval/Evidence 负责；Relevant Memory 主要召回人为决策、过程结论、约定和偏好。
+
+路由示例：
+
+- “哪里实现了缓存失效” → 代码检索；
+- “我们上次为什么决定用 SHA-256” → Memory；
+- “按照上次约定修改缓存失效代码” → Mixed，同时用 Memory 和代码检索；
+- “继续刚才的任务” → Resume/TaskState。
+
+### 7.4 Evidence Cache
+
+Evidence Cache 保存 `path + line range + content + file hash + symbol_id`，并具有：
+
+- SHA-256 新鲜度校验；
+- 覆盖范围匹配；
+- 修改文件后的按路径失效；
+- 有界条目数；
+- LRU 淘汰；
+- 大正文截断时标记 `complete=false`，避免把不完整缓存当作完整命中。
+
+检索候选命中后，Context Manager 只注入仍与候选来源及 hash 匹配的 Evidence。文件在外部被修改时，旧 Evidence 会被清除并记录失效元数据。
+
+### 7.5 去除上下文重复
+
+Context Manager 会避免以下重复：
+
+- Source Evidence 已覆盖的历史 `read_file`；
+- Direct Retrieval 已包含的相同内容；
+- 相同 durable/session memory 文本；
+- 旧文件读取结果可被仍然新鲜的 file summary 替代；
+- 老的 shell 输出只保留有界摘要。
+
+这使“检索位置”“已读事实”“历史动作”各保留一次。
+
+---
+
+## 8. 48,000 字符上下文预算
+
+### 8.1 为什么仍使用字符预算
+
+字符数具有实现简单、Provider 无关、装配前即可计算的优点。不同模型 Tokenizer 不同，强行用一个 Token 估算器容易产生另一种不准确。当前检索同时检查字符数和 UTF-8 字节上界，而总 Prompt 使用字符预算。
+
+面试时可以明确说明：这不是精确 Token 计费器，而是跨模型的确定性上限。生产化时可以为具体 Provider 插入 tokenizer，并保留字符硬上限作为第二道保护。
+
+### 8.2 默认分区
+
+| Section | 默认字符预算 | 作用 |
+|---|---:|---|
+| prefix | 6,000 | 系统规则、工具协议、Workspace 快照 |
+| skill catalog | 2,000 | 可用 Skill 元数据 |
+| active skills | 8,000 | 当前激活 Skill 正文 |
+| memory | 1,800 | 紧凑 Working State |
+| relevant memory | 1,200 | 最多 3 条相关记忆 |
+| retrieval | 2,400 | 位置候选卡 |
+| source evidence | 20,000 | 已读且新鲜的源码证据 |
+| history | 7,000 | 当前任务必要交互 |
+| current request | 不单独裁剪 | 当前用户请求 |
+
+这些分区相加可能超过总预算，因为它们是各区上限，不代表每轮都会全部占满。最终 Prompt 必须受 `48,000` 字符总预算约束。
+
+### 8.3 超预算时的压缩顺序
 
 ```text
-invalidate_file_summary
+skill_catalog
+-> relevant_memory
+-> retrieval
+-> history
+-> source_evidence
+-> memory
+-> prefix
 ```
 
-面试说法：
+各区还有 floor。当前请求不进入普通裁剪顺序。Skill 正文按完整块装入，空间不够时省略整块；Retrieval 和 Source Evidence 也尽量按完整证据单元装配，避免产生“半个函数”或“半条来源”。
 
-> Memory 不是完整聊天记录，而是从工具结果中提炼出来的高价值状态。比如文件读过之后会保存摘要和 freshness hash；如果文件被修改，摘要会失效，避免使用过期上下文。
+### 8.4 为什么 Source Evidence 预算最大
 
-## 8. Relevant Memory 召回
+Coding Agent 最终要修改代码，真实源码比摘要和候选分数更重要。Retrieval Candidate 只需告诉模型哪些位置值得读，因此预算较小；实际读到的源码证据需要容纳多个相关函数和测试，预算更大。
 
-相关记忆没有使用向量数据库，而是用简单透明的 token overlap：
+### 8.5 Prompt Cache
+
+Runtime 会对稳定前缀计算签名，并只对明确支持缓存语义的 Provider 发送 cache key。动态 History 和当前请求不会被当成稳定前缀。Provider 返回的 input/output/cached token 元数据会进入 Trace 和 Report，用于判断缓存是否真正命中。
+
+---
+
+## 9. Skill 路由与按需加载
+
+### 9.1 三阶段设计
 
 ```text
-用户问题 tokenize
-note 的 text/source/tags tokenize
-按 tag 命中、关键词重叠、时间、note_index 排序
-取前 3 条
+Discovery
+  只读取 SKILL.md 有界 frontmatter
+        |
+Routing
+  显式指定 / alias / trigger / metadata relevance
+        |
+Loading
+  读取选中正文，执行时再读取声明资源
 ```
 
-同时会混合 durable memory。
-
-面试说法：
-
-> 这里没有上复杂 embedding，而是用了一个轻量、可解释的关键词召回机制。优点是简单、可测试、结果可解释，适合本地 coding agent 的 MVP 阶段。
-
-## 9. Workspace Context
-
-`workspace.py` 负责构建仓库快照。
-
-它采集：
+目录示例：
 
 ```text
-cwd
-repo_root
-branch
-default_branch
-git status
-recent commits
-project docs snippets
+.bingo/skills/
+├── testing/
+│   ├── SKILL.md
+│   ├── references/
+│   └── templates/
+├── code-review/
+└── multi-agent-workflow/
 ```
 
-并生成 `fingerprint()`。这个 fingerprint 用来判断 workspace 是否发生变化。如果分支、status、文档摘要等变化，prefix 可能需要刷新。
+### 9.2 Registry 为什么不读取正文
 
-面试说法：
+如果启动时加载所有 Skill，Skill 数量增长会线性占用内存和 Prompt。Registry 最多扫描 128 个 Skill，每个 frontmatter 最多 8,192 字符，只注册：
 
-> WorkspaceContext 提供的是 agent 的“仓库第一印象”。它不会一开始读取整个仓库，而是只采集少量高价值信息，避免 prompt 爆炸。
+- name；
+- description；
+- version；
+- aliases；
+- triggers；
+- priority；
+- allowed_tools；
+- resources；
+- metadata hash。
 
-## 10. 工具系统与安全边界
+正文和资源在选中前不进入上下文。
 
-工具定义在 `tools.py`。
+### 9.3 当前语义匹配是不是 BM25
 
-基础工具包括：
+不是。SkillRouter 使用可解释的本地规则：
+
+- alias 边界命中最高可给 0.9；
+- trigger 子串命中从 0.55 起累计；
+- 查询词与 metadata routing text 做集合重叠；
+- 中文请求补充字符 bigram；
+- 默认阈值 0.35；
+- 自动语义路由只选择分数最高的一个 Skill；
+- 显式指定最多激活两个。
+
+这种算法数据量小、无需建索引、结果可解释。Skill 数量达到几百或描述很长时，可以升级为 BM25 或小型向量索引，但当前 128 个以内没有必要。
+
+### 9.4 Alias 的作用
+
+Alias 解决“同一技能有多个稳定名称”的问题。例如 Skill 名是 `testing`，用户可能写 `$test`。Alias 用于显式名称解析，也参与相关性匹配。它不是无匹配时强行选择 Skill。
+
+### 9.5 没有匹配为什么不选
+
+没有足够分数时 Route 返回 `fallback`，Runtime 继续通用 Agent 流程。Prompt 中仍保留最多 2,000 字符的 Skill Catalog，因此模型在后续推理中如果确认某个 Skill 有用，可以调用 `activate_skill`。如果项目根本没有对应 Skill，就不调用。
+
+### 9.6 Loaded 与 Active 的区别
+
+- **loaded**：正文已读过，Session 保存 hash，可用于重复加载检查；
+- **active**：当前用户请求真正启用，正文会进入本轮 Prompt；
+- 每次新请求开始重新路由 active Skill；
+- 文件 hash 变化时重新加载；
+- 资源只有显式声明且 Skill active 后才能读取。
+
+### 9.7 Skill 的安全边界
+
+- Skill 名和字段有长度、数量限制；
+- 资源只能使用允许的文本后缀；
+- 拒绝绝对路径和 `..`；
+- resolved path 必须仍位于 Skill 目录；
+- 正文最大 8,000 字符；
+- 资源单次最多返回 4,000 字符；
+- allowed_tools 只能收窄 Runtime 权限；
+- 多个 Active Skill 的非空 allowlist 取交集；
+- Skill 指令不能绕过 Runtime 的只读、审批和工作区限制。
+
+---
+
+## 10. 多 Agent Workflow
+
+### 10.1 调度原则
 
 ```text
-list_files
-read_file
-search
-run_shell
-write_file
-patch_file
-delegate
+父 Agent 能完成
+  -> 父 Agent
+
+确定性本地算法能完成
+  -> Local Tool
+
+存在 2～4 个互不依赖、范围不重叠的调查
+  -> Parallel Read-only Agents
+
+本地验证失败且需要复杂归因
+  -> Diagnostic Agent
 ```
 
-工具分成安全和高风险：
+多 Agent 的价值只有两个：缩短独立调查的关键路径，或者把大量推理过程隔离在父 Agent 上下文之外。
 
-- 读类工具：`list_files`、`read_file`、`search`，不需要审批。
-- 写类/执行类工具：`run_shell`、`write_file`、`patch_file`，标记为 risky，需要 approval policy 控制。
+### 10.2 Parallel Explore
 
-工具执行不是模型直接调用函数，而是经过 runtime 的 `run_tool()`，里面有完整护栏：
+适合：
+
+- API、存储和测试三个模块可以独立调查；
+- 多个候选实现需要并行收集证据；
+- 每个分支都有明确且不重叠的 scope。
+
+限制：
+
+- 2～4 个分支；
+- worker 数 2～4；
+- 子 Agent 最大 4 步；
+- scope 不能重叠；
+- 子 Agent 只读；
+- 单分支失败不取消其他分支，Workflow 标记 `partial_failed`。
+
+不适合“检索 → 编辑 → 测试 → 诊断”，因为每一步依赖上一步结果，应该由父 Agent 串行控制。
+
+### 10.3 Verification and Diagnosis
 
 ```text
-工具是否存在
-参数是否合法
-路径是否越界
-是否重复调用
-是否需要审批
-执行前后 workspace snapshot
-记录 affected paths / diff summary
-更新 memory
-写 trace
+local subprocess
+  -> stdout/stderr 落盘
+  -> regex parser
+  -> counts + failures + exception + source refs
+  -> diagnosis gate
+       |
+       +-- passed / 单个清晰失败 -> 父 Agent
+       |
+       +-- 多失败 / 跨模块 / 缺少细节 / 非结构化失败
+             -> Diagnostic Agent
 ```
 
-路径安全通过 `path()` 方法实现，用 `commonpath` 防止 `../` 跳出 workspace。
+测试执行不是子 Agent 的职责。退出码、passed/failed/skipped/errors 和标准 pytest 失败卡片由本地代码提取，零额外模型调用。
 
-`patch_file` 也很保守，要求 `old_text` 在文件中恰好出现一次，避免误改多个位置。
+### 10.4 子 Agent 报告如何压缩
 
-面试说法：
+压缩由本地算法完成，不再调用一个模型：
 
-> 模型不能直接碰文件系统，它只能请求工具调用。真正执行前 runtime 会做路径约束、参数校验、审批策略和重复调用检测。这样把模型的不确定性隔离在一个受控工具层里。
+- summary 最多 800 字符；
+- findings 最多 5 条；
+- 单字段最多 500 字符；
+- evidence_refs 最多 10 条；
+- 父 Agent 的 Workflow 汇总再次按 4,000 字符上限压缩；
+- 完整原始返回写入 `result.json`。
 
-## 11. Delegate 子 Agent
+如果压缩结果信息不足，父 Agent 根据 `workflow_id + artifact_ref + line range` 回读原始工件。单次最多读取 500 行、4,000 字符。这样摘要可以有损，但证据层无损可恢复。
 
-`delegate` 是一个只读子 agent。
+### 10.5 子 Agent 权限
 
-它会新建一个 `Bingo`，并设置：
+子 Agent 只拥有：
 
-```python
-approval_policy="never"
-read_only=True
-depth=agent.depth + 1
-max_steps 更小
-```
+- list_files；
+- read_file；
+- search；
+- list_skills；
+- activate_skill；
+- read_skill_resource；
+- read_workflow_artifact。
 
-用途是让子 agent 做受限调查，而不是执行危险操作。
+它不能写文件、执行 shell、再次委派或启动 Workflow。每个子 Agent 使用独立 Session、RunStore、ContextManager 和 clone 后的模型客户端，最大深度默认为 1。
 
-面试说法：
+---
 
-> delegate 是一个受限子任务机制。它继承父 agent 的 workspace 和 model client，但是 read-only，而且有 depth 和 max_steps 限制，避免递归失控。
+## 11. 工具与安全设计
 
-## 12. 模型适配层
+### 11.1 能力白名单
 
-`models.py` 把不同 provider 抹平成统一接口：
+工具不是自动反射出来的，而是在 `BASE_TOOL_SPECS` 中显式注册。每项工具包含 schema、风险等级、描述和实现函数。模型只能申请已注册工具。
 
-```python
-complete(prompt, max_new_tokens, ...)
-```
+### 11.2 三层校验
+
+1. **参数层**：类型、长度、范围、必填字段；
+2. **权限层**：read_only、allowed_tools、Skill allowlist、approval policy；
+3. **路径层**：resolve 后必须位于 repo root，拒绝越界与危险链接。
+
+### 11.3 写入策略
+
+- `write_file` 写完整文件；
+- `patch_file` 要求 old_text 恰好出现一次；
+- 命中 0 次或多次都拒绝；
+- 写入后旧 File Summary 和 Evidence Cache 按路径失效；
+- Risky 工具受 `ask / auto / never` 审批策略控制。
+
+`patch_file` 的严格唯一命中避免模型因为模糊字符串改错多个位置。
+
+### 11.4 Shell 环境
+
+Shell 子进程不会直接继承所有父进程环境变量，只传递显式 allowlist。名称包含 `API_KEY`、`TOKEN`、`SECRET`、`PASSWORD` 的配置值在 Trace、Report 和错误文本中统一替换为 `<redacted>`。
+
+### 11.5 Workspace 与索引安全
+
+语料枚举：
+
+- 遵循分层 `.gitignore` 和 `.bingoignore`；
+- 排除依赖、构建、缓存、工件和运行目录；
+- 排除 `.env*`、credentials 和 secrets 文件；
+- 排除符号链接、Windows junction/reparse point；
+- 只读取允许扩展名；
+- 单文件默认不超过 512 KiB；
+- 跳过二进制和非 UTF-8 文件。
+
+---
+
+## 12. Session、Checkpoint 与恢复
+
+### 12.1 Checkpoint 保存什么
+
+Checkpoint 保存：
+
+- 当前目标；
+- 下一步；
+- 关键文件及 freshness；
+- Runtime identity；
+- Workspace fingerprint；
+- 工具签名；
+- 模型、审批、feature flags 等运行配置。
+
+### 12.2 恢复状态
+
+| 状态 | 含义 |
+|---|---|
+| `no-checkpoint` | 没有可恢复点 |
+| `full-valid` | 文件和 Runtime identity 均一致 |
+| `partial-stale` | 关键文件已变化 |
+| `workspace-mismatch` | 模型、工具、工作区或策略发生变化 |
+| `schema-mismatch` | Checkpoint 版本不兼容 |
+
+恢复不是简单加载 JSON。Runtime 会重新计算文件 hash 与身份字段，过期信息不会被当作当前事实继续使用。
+
+---
+
+## 13. 模型后端
 
 支持：
 
-- `OllamaModelClient`
-- `OpenAICompatibleModelClient`
-- `AnthropicCompatibleModelClient`
-- `FakeModelClient`
+- Ollama；
+- OpenAI-compatible Responses API；
+- Anthropic-compatible Messages API；
+- DeepSeek 配置路径。
 
-`FakeModelClient` 用在测试和 benchmark，保证 deterministic。
+ModelClient 向 Runtime 暴露统一 `complete()` 接口，并把 HTTP、SSE、重试、文本抽取和 usage 字段封装在适配层。5xx、网络断开会有限重试；远程错误最终转成 Runtime 可记录的异常。
 
-OpenAI-compatible 还支持 prompt cache：
+并行子 Agent 要求 ModelClient 实现 `clone()`，返回独立实例，避免并发覆盖 `last_completion_metadata` 等可变状态。
 
-```text
-如果 backend 支持 prompt cache，就用 prefix hash 作为 prompt_cache_key
-```
+生成模型与 Embedding 模型分开配置。代码可以使用远程大模型，同时在本地使用 FastEmbed；也可以完全使用本地后端，取决于代码保密要求。
 
-面试说法：
+---
 
-> runtime 不关心 HTTP 细节，只依赖统一的 `complete()`。不同 provider 的 endpoint、payload、usage metadata、SSE/JSON 差异都封装在 models.py 里。
+## 14. 可复现评测
 
-## 13. Prompt Cache 设计
+### 14.1 为什么不能用模型自评
 
-`Bingo.build_prefix()` 会生成 `prefix_state`：
-
-```python
-PromptPrefix(
-    text,
-    hash,
-    workspace_fingerprint,
-    tool_signature,
-    built_at
-)
-```
-
-每次 build prompt 时，会检查 workspace 或 tools 是否变化。稳定 prefix 的 hash 可以作为 cache key。
-
-面试说法：
-
-> prompt cache 的 key 不是整个 prompt 的 hash，而是稳定 prefix 的 hash。因为 history 和 current request 每轮都会变，如果对整段 prompt 缓存命中率会很差。这里缓存的是相对稳定的前缀部分。
-
-## 14. Session、Run、Trace、Report 的区别
-
-`SessionStore` 保存可恢复状态：
+模型输出“已经修复”不代表任务成功。E2E 的成功条件是：
 
 ```text
-.bingo/sessions/<session_id>.json
+verifier exit code == 0
+AND expected artifacts exist
+AND Agent returned normal final
+AND tool steps stayed within budget
 ```
 
-里面有：
+评测在仓库隔离副本上运行，不修改原始仓库。
+
+### 14.2 E2E 分类
+
+- scripted smoke：验证 Harness 链路，不代表模型能力；
+- mutation repair：真实仓库快照中注入已知缺陷；
+- historical issue：从真实历史问题构造；
+- synthetic distractor：只用于规模压力；
+- real repository retrieval：真实源码位置标注。
+
+面试时必须区分 Harness 可运行与真实模型任务完成率。
+
+### 14.3 检索指标
+
+- **Recall@5**：正确文件是否进入前 5；
+- **MRR**：第一个正确结果的倒数排名均值；
+- **No-answer accuracy**：无答案查询能否正确不返回候选；
+- **P50/P95**：预热后的查询延迟；
+- **micro**：所有查询共同统计；
+- **macro**：每仓库等权，避免大仓库支配结果。
+
+### 14.4 当前真实数据
+
+固定报告包含：
+
+- 1 个真实仓库快照；
+- 55 个 Python 源文件；
+- 约 16.9 K 物理 LoC；
+- 854 个 Symbol；
+- 1,708 张短向量卡；
+- 100% 向量覆盖率；
+- 12 条标注查询，其中 11 条可回答、1 条无答案；
+- 每条查询预热 1 次并测量 5 次；
+- Top-K 固定为 5。
+
+| 模式 | Recall@5 | MRR | P95 | 无答案准确率 |
+|---|---:|---:|---:|---:|
+| Vector | 0.909 | 0.576 | 358.56 ms | 1.000 |
+| Hybrid | 0.909 | 0.544 | 387.69 ms | 1.000 |
+| Auto | 0.727 | 0.526 | 384.09 ms | 1.000 |
+
+Hybrid 相对 Vector：
+
+- Recall@5 持平；
+- MRR 相对下降 5.53%；
+- P95 上升 8.12%。
+
+### 14.5 如何解释负向结果
+
+不要回避。可以这样回答：
+
+> 这组数据说明 Hybrid 的召回通道更多，但当前 RRF 权重和精确符号排序还没有校准好；加入更多候选没有提高 Recall，反而把部分正确结果向后挤，同时增加向量查询延迟。工程价值在于评测框架能发现退化，并给出具体优化方向：查询分类、通道权重、候选去重、reranker 和无答案阈值。当前默认 Auto 也因此仍是实验状态，不能宣称已经优于纯向量。
+
+这比只展示合成数据上的漂亮结果更可信。
+
+### 14.6 当前自动化验证
+
+2026-09-11 在项目虚拟环境执行：
 
 ```text
-history
-memory
-checkpoints
-resume_state
-runtime_identity
+224 passed, 4 skipped, 0 failed in 89.89s
 ```
 
-`RunStore` 保存单次运行审计产物：
+核心专项回归（Symbol Retrieval、Context、Skill、Workflow）为 56 passed, 1 skipped in 5.04s；Retrieval 与安全边界专项为 31 passed, 1 skipped in 3.86s。两个 skip 都是当前 Windows 权限不足时无法创建符号链接的条件测试，不是功能失败。Python 字节码编译检查通过。
 
-```text
-.bingo/runs/<run_id>/task_state.json
-.bingo/runs/<run_id>/trace.jsonl
-.bingo/runs/<run_id>/report.json
+原先的 2 条 Windows GBK 解码 warning 已修复。根因是 `WorkspaceContext.build()` 通过 `text=True` 读取 Git 输出时继承系统 GBK，而仓库绝对路径包含 UTF-8 中文字节。当前在该进程边界显式使用 `encoding="utf-8"` 和 `errors="replace"`，并把 `PytestUnhandledThreadExceptionWarning` 提升为错误运行全量回归，结果仍为 224 passed、4 skipped。
+
+当前代码规模：
+
+- Runtime 包：31 个 Python 文件，约 11.6 K 行；
+- 测试目录：21 个 Python 文件，约 5.1 K 行；
+- 测试覆盖 Agent、Context、Memory、Evidence、Retrieval、Symbol、Skill、Workflow、Safety、Evaluator、Metrics 和 CLI。
+
+### 14.7 哪些数据能写简历
+
+可以写：
+
+- 224 passed、4 skipped；
+- 真实快照的文件、LoC、Symbol 和向量卡规模；
+- 当前 Recall@5、MRR、P95；
+- 明确写成“小样本检索消融”；
+- scripted E2E 只写“验证评测链路”。
+
+暂时不能写：
+
+- “在多个真实仓库达到 100% 完成率”；
+- “Hybrid 全面优于 Vector”；
+- “大仓库性能经过充分验证”；
+- 把 scripted smoke 的 2/2 当成真实 LLM 成绩。
+
+达到至少 5 个固定 revision 仓库、100 条检索查询、30 个真实模型任务且每项重复 3 次后，才适合形成更强的简历结论。
+
+---
+
+## 15. 典型任务时序
+
+用户请求：“定位会话恢复失败原因，修改代码并运行测试。”
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant R as Runtime
+    participant C as Context Manager
+    participant Q as Retrieval
+    participant M as Model
+    participant T as Tools
+    participant V as Verifier
+
+    U->>R: 提交任务
+    R->>R: Skill/Context 路由
+    R->>Q: auto retrieve
+    Q-->>R: Symbol 位置候选
+    R->>C: 组装候选、记忆、历史
+    C-->>M: Prompt
+    M-->>R: read_symbol
+    R->>T: hash 校验并读取源码
+    T-->>R: Source Evidence
+    R->>C: 重组 Prompt
+    C-->>M: 新鲜源码证据
+    M-->>R: patch_file
+    R->>T: 校验唯一命中并修改
+    T-->>R: 写入成功，缓存失效
+    R->>V: 本地执行相关测试
+    V-->>R: exit code 与结构化结果
+    R->>C: 最终状态
+    C-->>M: 验证证据
+    M-->>U: 最终回答
 ```
 
-区别：
+这个例子能串起检索、Evidence、编辑、失效、验证与最终回答，是面试现场最适合讲的一条链路。
 
-```text
-session：为了恢复对话
-run：为了复盘单次任务
-trace：过程事件流
-report：最终摘要
-task_state：当前任务状态快照
+---
+
+## 16. 高频深挖问题与参考回答
+
+### Q1：这和普通的 LLM API Wrapper 有什么区别？
+
+Runtime 持有状态机、工具协议、权限、上下文预算、检索路由、恢复、审计和评测。模型只是决策组件。即使更换 Provider，控制链路和安全边界仍然存在。
+
+### Q2：为什么用 ReAct 循环？
+
+Coding 任务需要观察源码、采取动作、查看结果再决定下一步。一次性 Prompt 无法提前知道工具结果。ReAct 让模型逐步决策，而 Runtime 给每一步设置确定性边界。
+
+### Q3：如何防止无限循环？
+
+同时限制 tool_steps 和 attempts；重复工具调用会被检测；协议连续失败会命中重试上限；每种停止原因写入 TaskState 和 Report。
+
+### Q4：为什么检索路由不用另一个大模型？
+
+当前分类特征有限且规则明确，本地正则延迟低、成本为零、易复现。未来当查询类型复杂到规则维护成本明显上升时，可以加入小模型分类器，但必须保留置信度与 fallback。
+
+### Q5：为什么小仓库不走 RAG？
+
+当明确范围或小仓库概览能完整装入预算时，Direct 没有召回损失，也省去索引和检索延迟。自适应策略的目标是选择成本最低且证据足够的路径。
+
+### Q6：为什么 Embedding 不存完整代码？
+
+长方法包含大量局部变量、错误处理和实现细节，会稀释函数的核心语义。短卡只保留身份、目的和有界行为特征，命中后再读取完整源码。
+
+### Q7：只有位置让模型读取文件不可以吗？
+
+位置本身无法回答“从几千个位置中选择哪个”。Symbol 和 BM25 可处理精确问题，Vector 补充自然语言与代码标识符之间的语义映射。向量用于选位置，不用于替代源码事实。
+
+### Q8：为什么每个 Symbol 两张卡？
+
+Identity 对精确名称、签名和模块敏感；Behavior 对用途、调用和返回行为敏感。分开后不会让行为字段稀释身份字段，也能在融合时让任一视角召回同一 Symbol。
+
+### Q9：Symbol Graph 会不会产生错误边？
+
+会，所以实现选择保守解析。只有同文件或全局唯一名称才连接调用/继承边，歧义时放弃。Graph 只做候选扩展，最终事实仍要读取源码确认。
+
+### Q10：为什么 Graph 只扩展一跳？
+
+多跳会快速放大噪声和候选数量。Coding Agent 通常先需要直接调用者、被调用者、父类或成员；一跳足以提供局部结构，后续可由模型基于新证据继续检索。
+
+### Q11：为什么选 RRF？
+
+BM25 值、余弦相似度和图置信度量纲不同。RRF 只依赖各通道排名，不需要难以稳定维护的分数归一化，同时可以表达通道先验权重。
+
+### Q12：为什么 Hybrid 当前比 Vector 差？
+
+多通道召回并不自动等于更好的排序。当前小样本中 Symbol/BM25 候选会把部分正确 Vector 结果向后挤，RRF 权重和查询分类还未校准；额外通道也增加延迟。
+
+### Q13：索引如何增量更新？
+
+CorpusIndex 记录每个文件 SHA-256。sync 时只重建新增或变化文件的 Chunk、FTS、Symbol、边和待更新短卡；删除文件对应记录也会清理。Symbol 卡 hash 或模型身份变化时才重新生成向量。
+
+### Q14：Embedding 维度变化怎么办？
+
+同一模型 identity 下如果新向量维度和已存向量不同，索引拒绝继续写入，避免混用不可比较的向量。模型或卡 schema 变化会触发旧 Symbol Vector 清理。
+
+### Q15：检索索引过期怎么办？
+
+返回候选前重新读取文件并比较 content hash。read_symbol 还会再次同步索引并验证 expected_hash。任何不一致都拒绝把旧位置当作当前源码。
+
+### Q16：Memory 与 RAG 最大区别是什么？
+
+Memory 保存历史决策和稳定事实，RAG 定位当前仓库源码。Memory 面向“之前知道什么”，Retrieval 面向“现在应该读哪里”，Evidence 面向“已经验证过哪些源码事实”。
+
+### Q17：为什么 Relevant Memory 不用向量数据库？
+
+候选规模很小，内容主要是短决策和标签。token/tag overlap 更透明、更便宜。规模扩大后可以替换召回器，但不需要改变 Memory 与 Evidence 的边界。
+
+### Q18：为什么用字符预算而不是 Token？
+
+字符预算确定、跨 Provider、无需加载 tokenizer。缺点是不等于真实 token，因此检索还使用 UTF-8 字节上界做保守限制。Provider 专用 tokenizer 是后续优化项。
+
+### Q19：为什么当前请求不裁剪？
+
+它是本轮最高优先级信息。裁剪用户最新约束可能让 Agent 执行错误任务。系统通过压缩其他区块腾出空间；极端超长请求应在输入边界单独拒绝或摘要，而不是静默截断。
+
+### Q20：Skill Router 的“语义”真的是向量语义吗？
+
+不是。当前是 metadata term overlap、trigger 和 alias 的确定性相关性评分，中文使用 bigram。文档称为元数据相关性路由更准确。
+
+### Q21：Router 没匹配 Skill，模型怎么知道有这个能力？
+
+Context 中保留有界 Skill Catalog。规则 Router 没命中时，模型仍能看到名称和描述，并在推理确认相关后调用 activate_skill；确实无关时继续通用流程。
+
+### Q22：为什么不启动时加载所有 Skill？
+
+Skill 数量越多，Prompt 成本越高，还会产生相互干扰。元数据发现、正文加载和资源读取分三层，只有当前任务真正需要的内容才进入上下文。
+
+### Q23：Skill 能扩大工具权限吗？
+
+不能。Skill allowlist 只能对 Runtime 工具集取交集并收窄。只读、审批、工作区路径和子 Agent 限制具有更高优先级。
+
+### Q24：为什么不让子 Agent 执行测试？
+
+测试命令和标准结果是确定性的。本地执行加正则解析更快、零模型成本。只有失败关系复杂且规则无法归因时，才值得调用诊断 Agent。
+
+### Q25：子 Agent 摘要会丢信息吗？
+
+父上下文中的摘要是有损的，但原始 stdout、stderr 和 result.json 无损落盘。摘要始终带 artifact_ref，父 Agent 可以按行有界回读，因此不会因一次截断永久丢失证据。
+
+### Q26：并行子 Agent 会不会同时改坏代码？
+
+不会。子 Agent 的 allowed_tools 只有只读调查工具，父 Agent 是唯一源码写入者；分支 scope 还要求不重叠。
+
+### Q27：为什么最多四个分支？
+
+过多分支会增加模型调用、调度和整合成本，也容易制造伪并行。2～4 是当前控制复杂度的工程边界，未来应由任务收益数据而不是拍脑袋扩大。
+
+### Q28：如果一个并行分支失败怎么办？
+
+其他分支继续执行，Workflow 返回 partial_failed。失败日志保留在工件中，父 Agent 可以根据成功分支继续工作或只重试失败范围。
+
+### Q29：如何保护密钥？
+
+真实 `.env` 被 Git 忽略；语料枚举排除秘密文件；Shell 只接收环境变量 allowlist；配置的 Secret 值在 Trace、Report 和错误信息中脱敏。
+
+### Q30：路径安全如何保证？
+
+所有用户或模型提供的路径都经过 resolve，并要求位于 repo root；索引和 Skill 还检查 symlink、junction 与资源目录包含关系；Workflow ID、节点和工件名使用安全字符白名单。
+
+### Q31：Checkpoint 与 Session 有什么区别？
+
+Session 是持续的会话状态容器；Checkpoint 是某一时刻可验证的恢复快照，带关键文件 hash 和 Runtime identity。恢复时必须判断 Checkpoint 是否仍然适用。
+
+### Q32：为什么 Trace 使用 JSONL？
+
+Agent 运行是事件流。JSONL 可以逐条追加，进程中断时前面的事件仍然可读，也便于按行分析；最终汇总再写 Report JSON。
+
+### Q33：如何定义任务完成率？
+
+由确定性 Verifier、预期产物、正常停止原因和步数预算共同判定，模型的自我声明不参与评分。
+
+### Q34：为什么既看 Recall@5 又看 MRR？
+
+Recall@5 判断正确文件是否进入模型可读候选，MRR 判断正确结果是否足够靠前。二者结合能区分“召回到了但排序差”和“完全没召回”。
+
+### Q35：如何避免 Benchmark 数据泄漏？
+
+查询定义文件和评测文档从待检索副本中排除；仓库固定 revision 或完整内容快照；E2E 在隔离副本上注入缺陷并运行 Verifier。
+
+### Q36：目前最大的技术债是什么？
+
+Auto 路由和 RRF 尚未在大样本上校准；AST 仅支持 Python；字符预算不等于真实 Token；其余 subprocess 调用点的编码策略还没有统一封装；真实 LLM E2E 样本量不足。
+
+### Q37：下一步如何优化 Hybrid？
+
+先扩充标注集并按 query type 分层，再做权重网格搜索或学习排序；增加 exact symbol/file boost；对负向查询校准阈值；比较 cross-encoder reranker 的收益与延迟；避免只在当前 12 条查询上过拟合。
+
+### Q38：如何支持更多语言？
+
+用 Tree-sitter 或语言原生 parser 生成统一 Symbol Schema。RetrievalEngine 不需要感知具体 AST，只消费 symbols、cards 和 edges，因此语料层可以逐语言扩展。
+
+### Q39：如何从单机扩展到大型企业仓库？
+
+将 SQLite/向量索引按 repo revision 分片；增量索引任务异步化；ANN 索引持久化；按目录/模块做 coarse-to-fine 检索；缓存 query embedding；对 ACL 和敏感目录加入索引前过滤。
+
+### Q40：这个项目中你的个人贡献应该怎么说？
+
+应明确说是基于第三方公开项目进行二次开发，然后具体列出自己能够用源码和测试证明的部分，例如自适应检索、Symbol Graph、上下文分层、Skill 生命周期、Workflow 门控和评测体系。不要把继承的基础代码说成完全原创，也不要只说“加了 RAG”，要说明你重新设计了哪些边界、为什么这样设计、数据结果是什么。
+
+---
+
+## 17. 系统设计追问时的权衡表
+
+| 设计选择 | 得到什么 | 付出什么 |
+|---|---|---|
+| 规则 Context Router | 快、可解释、零调用 | 泛化有限 |
+| Symbol 短卡 | 语义集中、索引较小 | 丢失部分实现细节 |
+| 二阶段源码读取 | 新鲜、可定位、可审计 | 多一次工具交互 |
+| RRF | 跨通道融合简单稳定 | 权重仍需数据校准 |
+| 字符预算 | Provider 无关、实现确定 | Token 估算不精确 |
+| 本地测试解析 | 成本低、结果稳定 | 需要适配更多测试框架 |
+| 子 Agent 只读 | 无并发写冲突 | 父 Agent 承担统一编辑 |
+| 无损工件 + 有损摘要 | 控制上下文且可恢复 | 增加磁盘和工件管理 |
+| SQLite FTS5 | 单机部署简单 | 超大规模并发能力有限 |
+| 保守 Symbol Graph | 精度较高 | 动态调用召回不足 |
+
+面试官问“为什么这样做”时，先说具体失败模式，再说选择，最后主动说代价。能讲出代价比只讲优点更可信。
+
+---
+
+## 18. 现场演示建议
+
+### 18.1 5～8 分钟演示路线
+
+1. 展示 CLI 和工具目录；
+2. 运行一个精确 Symbol 查询；
+3. 展示返回的 symbol_id、行号和 hash；
+4. 使用 read_symbol 读取当前源码；
+5. 运行一个自然语言查询，展示 Auto 的 route_reason 和 channels_used；
+6. 修改目标文件后演示旧 hash 被拒绝；
+7. 运行相关测试并展示结构化计数；
+8. 打开 Trace/Report，证明过程可回溯。
+
+### 18.2 推荐命令
+
+```powershell
+bingo-retrieve "ContextManager.build"
+
+bingo-retrieve "哪里负责校验过期的源码证据"
+
+bingo-benchmark inventory
+
+python -m pytest tests/test_symbol_retrieval.py -q
+
+python -m pytest tests/test_workflows.py -q
 ```
 
-`trace.jsonl` 是追加写，适合记录事件序列：
-
-```text
-run_started
-prompt_built
-model_requested
-model_parsed
-tool_executed
-checkpoint_created
-run_finished
-```
+正式演示前先在本机运行一遍，并使用当前实际输出，不要背历史耗时。
 
-`report.json` 更像最终汇总，包括最终答案、tool steps、prompt metadata、memory promotion 等。
+### 18.3 演示时不要做什么
 
-## 15. TaskState 状态机
+- 不要把 scripted smoke 当真实模型效果；
+- 不要声称 Hybrid 已优于 Vector；
+- 不要临时展示真实 API Key；
+- 不要从网络现场下载大模型；
+- 不要用超大仓库做第一次冷启动演示；
+- 不要跳过失败案例和 fallback_reason。
 
-`task_state.py` 记录单次 `ask()` 的状态。
+---
 
-字段包括：
+## 19. 简历表述模板
 
-```text
-run_id
-task_id
-user_request
-status
-tool_steps
-attempts
-last_tool
-stop_reason
-final_answer
-checkpoint_id
-resume_status
-```
+> **Bingo｜本地 Coding Agent Runtime**
+> 基于第三方公开项目进行二次开发，设计并实现按仓库规模、查询类型、证据质量和上下文预算路由的自适应检索；使用 Python AST 构建类/函数/方法多粒度 Symbol Graph，将源码向量化重构为有界 identity/behavior 短卡，并通过 Symbol ID 与 SHA-256 实现“候选定位—源码按需读取—过期证据拒绝”的两阶段链路。实现 48K 字符分区上下文、Memory/Evidence 职责隔离、SKILL.md 元数据路由与延迟加载，以及父 Agent/本地算法/只读子 Agent 的门控 Workflow。构建固定快照、确定性 Verifier、Trace 和消融报告；当前全量回归 224 passed、4 skipped，真实快照检索覆盖 55 个 Python 文件、16.9K LoC、854 个 Symbol 和 1,708 张短卡。
 
-状态包括：
+如果简历版面有限，保留“问题—核心设计—验证数据”三部分，不要堆模块名称。
 
-```text
-running
-completed
-stopped
-failed
-```
+---
 
-停止原因包括：
+## 20. 当前不足与迭代路线
 
-```text
-final_answer_returned
-step_limit_reached
-retry_limit_reached
-model_error
-tool_timeout
-approval_denied
-```
+### P0：数据可信度
 
-面试说法：
+- 扩充到至少 5 个固定 revision 的真实仓库；
+- 检索查询不少于 100 条；
+- 真实模型任务不少于 30 条，每项重复至少 3 次；
+- 给出置信区间、失败类别和 Token 覆盖率。
 
-> TaskState 让每次运行有明确生命周期。它区分 status 和 stop_reason，status 表示结果状态，stop_reason 表示为什么停下来，这样 benchmark 和 report 可以更精确分析失败原因。
+### P1：检索质量
 
-## 16. Checkpoint 与恢复机制
+- 对 query type 分层调 RRF 权重；
+- 增加精确文件/符号 boost；
+- 评估轻量 reranker；
+- 为无答案查询校准阈值；
+- 把 Auto 误路由纳入错误分类。
 
-checkpoint 保存：
+### P1：语言覆盖
 
-```text
-checkpoint_id
-parent_checkpoint_id
-schema_version
-current_goal
-completed
-current_blocker
-next_step
-key_files
-freshness
-runtime_identity
-summary
-```
+- 引入 Tree-sitter；
+- 统一 Python、TypeScript、Java、Go Symbol Schema；
+- 增加跨语言调用边的置信度等级。
 
-关键点是 `key_files` 会保存文件 hash。
+### P2：上下文与运行稳定性
 
-恢复时 `evaluate_resume_state()` 会判断：
+- 接入 Provider tokenizer；
+- 保留字符硬上限；
+- 把已验证的 UTF-8 解码策略推广到其余 subprocess 调用点；
+- 加入 Prompt 区块实际收益和 Token 成本统计。
 
-1. checkpoint schema 是否匹配。
-2. key files 是否 stale。
-3. runtime identity 是否变化。
+### P2：工程发布
 
-恢复状态包括：
+- 明确第三方代码的许可证与授权；
+- 在 README 保留来源、修改说明和必要版权文本；
+- 增加 CI 矩阵和跨平台验证；
+- 对 Benchmark Artifact 提供可公开复核的固定 revision。
 
-```text
-no-checkpoint
-full-valid
-partial-stale
-workspace-mismatch
-schema-mismatch
-```
+---
 
-然后 `render_checkpoint_text()` 会把恢复信息塞进下一轮 prompt。
+## 21. 源码阅读顺序
 
-面试说法：
+第一次复习：
 
-> 恢复不是简单加载历史，而是带一致性检查。它会检查关键文件 hash 和 runtime identity，避免在文件已经变化、工具签名变化、模型参数变化时盲目继续。
+1. `bingo/runtime.py::Bingo.ask`
+2. `bingo/tools.py::BASE_TOOL_SPECS`
+3. `bingo/context_manager.py::ContextManager.build`
+4. `bingo/retrieval.py::RetrievalEngine.search`
+5. `bingo/retrieval_corpus.py::extract_symbols`
+6. `bingo/retrieval_corpus.py::symbol_cards`
+7. `bingo/evidence_cache.py::EvidenceCache`
+8. `bingo/skill_router.py::SkillRouter.route`
+9. `bingo/workflow_engine.py::WorkflowEngine`
+10. `bingo/real_benchmark.py::RealRepositoryEvaluator`
 
-## 17. 安全与隐私设计
+第二次复习再读测试：
 
-项目里有几层安全设计：
+1. `tests/test_bingo.py`
+2. `tests/test_context_manager.py`
+3. `tests/test_retrieval.py`
+4. `tests/test_symbol_retrieval.py`
+5. `tests/test_skills.py`
+6. `tests/test_workflows.py`
+7. `tests/test_safety_invariants.py`
+8. `tests/test_real_benchmark.py`
 
-1. workspace path 限制
-   所有文件路径都必须在 repo root 下。
+---
 
-2. risky tool 审批
-   `run_shell`、`write_file`、`patch_file` 需要 approval policy。
+## 22. 面试前检查清单
 
-3. read_only 模式
-   delegate 子 agent 和某些模式下禁止写操作。
+- [ ] 能在 30 秒内说清项目解决什么问题；
+- [ ] 能画出 Runtime、Context、Retrieval、Tools、Store 五层；
+- [ ] 能解释为什么不是所有查询都走 RAG；
+- [ ] 能手写 Auto 路由的主要分支；
+- [ ] 能说出 Symbol 卡进入和不进入 Embedding 的字段；
+- [ ] 能解释 RRF 公式与权重；
+- [ ] 能区分 Memory、Candidate、Evidence；
+- [ ] 能解释 Skill fallback 和模型动态激活；
+- [ ] 能解释为什么测试先由本地算法处理；
+- [ ] 能说明子 Agent 的只读权限和工件回读；
+- [ ] 能说出当前 224 passed、4 skipped；
+- [ ] 能如实解释 Hybrid 的负向结果；
+- [ ] 能列出至少三个当前不足；
+- [ ] 能明确第三方基础与个人改造边界；
+- [ ] 能用实际命令完成一次检索和一次专项测试。
 
-4. shell 环境变量 allowlist
-   `run_shell` 不继承完整环境，而是只传允许的环境变量，避免 secret 泄露。
+---
 
-5. secret redaction
-   runtime 会识别 API key、token、password 等敏感字段，并在 trace/report 中打码。
+## 23. 相关文档
 
-6. 重复工具调用检测
-   防止模型卡住连续重复调用同一个工具。
+- [README](README.md)
+- [自适应检索设计](docs/retrieval.md)
+- [检索验证说明](docs/retrieval-validation.md)
+- [Skill 路由与按需加载](docs/skills.md)
+- [有门控的多 Agent Workflow](docs/workflows.md)
+- [真实仓库评测框架](docs/real-benchmark.md)
+- [真实仓库验证报告](docs/metrics/real-repository-validation.md)
+- [测试架构指南](docs/test-architecture-guide.md)
+- [简历项目说明](docs/resume-project-description.md)
 
-面试说法：
+---
 
-> 对 coding agent 来说，安全边界非常重要。这个项目的思路是模型只表达意图，runtime 负责执行控制。所有危险行为都经过工具层、审批层、路径层和审计层。
+## 24. 最后记忆框架
 
-## 18. Benchmark 与评测体系
+面试时围绕以下一句话展开即可：
 
-`evaluator.py` 提供 benchmark harness。
+> Bingo 把模型放在一个可控 Runtime 里：检索负责找到位置，Evidence 负责提供当前源码，Memory 负责保留历史决策，Skill 负责按需注入流程，Workflow 负责选择父 Agent、本地算法或只读子 Agent，Verifier 和 Trace 负责证明结果。
 
-它会：
-
-1. 读取 `benchmarks/coding_tasks.json`。
-2. 复制 fixture repo 到临时目录。
-3. 用 `FakeModelClient` 跑确定性任务。
-4. 执行 agent。
-5. 检查产物是否存在。
-6. 跑 verifier。
-7. 统计是否 within budget、verifier 是否通过、stop reason 是否正常。
-8. 输出 benchmark artifact。
-
-面试说法：
-
-> 我没有只靠人工试用验证，而是做了一个 deterministic benchmark harness，用 scripted model output 固定模型行为，从而测试 runtime、工具、上下文、恢复机制这些确定性部分。
-
-## 19. Metrics 与消融实验
-
-`metrics.py` 做了更多实验：
-
-- context ablation
-  比较开启/关闭 context reduction 后 prompt 大小、当前请求是否保留。
-
-- memory ablation
-  比较 memory on/off/irrelevant 时是否需要重复读文件。
-
-- recovery ablation
-  比较 resume enabled/disabled 对恢复成功率、stale detection、workspace drift detection 的影响。
-
-- run artifact aggregation
-  从 `.bingo/runs` 里聚合 tool status、stop reason、prompt chars、cache hit rate 等。
-
-面试说法：
-
-> 这个项目不是只实现功能，还围绕 agent runtime 做了实验评估。通过消融实验可以证明 memory、context reduction、resume recovery 分别带来的收益。
-
-## 20. 测试覆盖点
-
-测试目录在 `tests/`。
-
-主要覆盖：
-
-- context manager section 顺序、压缩策略、当前请求保留。
-- memory 的文件摘要、stale invalidation、retrieval。
-- run store 的原子写入和 artifact。
-- task state 的状态转换。
-- evaluator 的 benchmark schema 和执行结果。
-- safety invariants，比如路径逃逸、重复工具调用、审批拒绝。
-- bingo 主流程，比如 tool call、final answer、checkpoint、trace。
-
-面试说法：
-
-> 测试重点不是模型能力，而是 runtime contract。因为模型输出不可控，所以我用 FakeModelClient 固定输出，验证工具协议、上下文拼装、状态落盘和安全约束这些确定性逻辑。
-
-## 21. 项目技术亮点总结
-
-可以总结成 8 个亮点：
-
-1. Agent runtime 控制循环
-   实现了 `prompt -> model -> parse -> tool -> record -> next prompt` 的闭环。
-
-2. 结构化工具协议
-   模型输出必须是 `<tool>` 或 `<final>`，降低解析不确定性。
-
-3. 分层上下文管理
-   prefix、memory、relevant memory、history、current request 分区预算管理。
-
-4. 上下文压缩策略
-   优先保留当前请求和稳定规则，对旧历史做语义压缩。
-
-5. 轻量记忆系统
-   working memory、episodic notes、file summaries、durable memory。
-
-6. 可恢复 checkpoint
-   基于 key file freshness 和 runtime identity 判断恢复状态。
-
-7. 安全工具层
-   路径限制、审批策略、只读模式、secret redaction、重复调用检测。
-
-8. 可审计与可评测
-   session/run/trace/report 分离，并配套 benchmark、metrics、ablation。
-
-## 22. 面试完整讲解稿
-
-下面这段可以直接背熟，然后按面试官追问展开。
-
-> 这个项目是一个本地 coding agent，目标是让大模型可以在本地代码仓库里安全、可控、可恢复地完成工程任务。整体上我把它拆成 CLI、runtime、context manager、memory、workspace、tools、model adapter、run store 和 evaluator 几层。
->
-> CLI 层负责解析参数、选择模型 provider、加载 `.env`、构建 workspace 快照，然后创建或恢复一个 Bingo agent。真正的核心在 runtime，也就是 `Bingo.ask()`。每次用户输入进来之后，runtime 会先把用户消息写入 session history，然后通过 ContextManager 重新构建 prompt。模型返回后，runtime 会解析它是工具调用还是最终答案。如果是工具调用，就经过工具校验、安全审批、路径约束后执行，再把结果写回 history、memory、trace 和 checkpoint，继续下一轮；如果是 final，就结束任务并写 report。
->
-> 上下文处理是这个项目的重点。它不是简单把聊天记录全塞给模型，而是分成 prefix、memory、relevant memory、history、current request 五块。prefix 是稳定规则和工具说明，memory 是压缩后的工作状态，relevant memory 是根据当前问题召回的相关笔记，history 是会话历史，current request 是当前用户请求。ContextManager 给每个部分设置预算，如果超出总预算，会按 relevant memory、history、memory、prefix 的顺序压缩，但当前请求永远不裁剪。
->
-> Memory 这一层也做了分层。读文件后会记录 recent files、生成 file summary，并追加 episodic note；写文件或 patch 文件后会让旧 summary 失效。每个 file summary 还带文件 hash，也就是 freshness，用来防止文件变化后继续使用过期摘要。长期记忆则落到 `.bingo/memory` 下，用 topic 管理项目约定、关键决策、依赖事实和用户偏好。
->
-> 工具系统是安全边界。模型不能直接操作文件系统，只能请求 `list_files`、`read_file`、`search`、`run_shell`、`write_file`、`patch_file`、`delegate` 这些注册工具。runtime 在执行前会检查工具是否存在、参数是否合法、路径是否逃逸 workspace、是否重复调用、是否需要审批。对于写文件、shell 这类 risky tool，还会根据 approval policy 控制。执行后还会记录 affected paths、diff summary，并写入 trace。
->
-> 恢复机制通过 checkpoint 实现。每次关键节点都会创建 checkpoint，保存当前目标、下一步、阻塞点、关键文件和文件 freshness。恢复 session 时，系统会检查 checkpoint schema、关键文件 hash、runtime identity，比如 cwd、model、tool signature、workspace fingerprint 是否变化。如果文件变了就是 partial-stale，如果 workspace 或 runtime 变了就是 workspace-mismatch，然后把这些恢复状态写进下一轮 prompt，避免 agent 盲目继续。
->
-> 模型层通过 adapter 把 Ollama、OpenAI-compatible、Anthropic-compatible、DeepSeek 统一成 `complete(prompt, max_new_tokens)` 接口。OpenAI-compatible 还支持 prompt cache，用稳定 prefix 的 hash 作为 cache key，而不是用整个 prompt，因为 history 和当前请求每轮都会变。
->
-> 最后，项目还有 benchmark 和 metrics。benchmark 使用 FakeModelClient 固定模型输出，在 fixture repo 里跑确定性任务，用 verifier 检查产物；metrics 做 context、memory、recovery 的消融实验，证明这些模块对 prompt 压缩、减少重复读取、恢复成功率有实际作用。整体上这个项目关注的不是单纯模型能力，而是如何把大模型包装成一个工程上可控、可审计、可测试的本地 coding agent。
-
-## 23. 常见面试问题
-
-### Q1: 这个项目和普通 ChatGPT 调 API 有什么区别？
-
-普通调用 API 只是输入 prompt、拿输出。这个项目在模型外面实现了完整 runtime，包括工具协议、上下文预算、工作记忆、工具安全校验、session 恢复、运行审计和 benchmark。模型只是决策器，真正的工程控制在 runtime。
-
-### Q2: 为什么不用完整历史？
-
-完整历史会导致 prompt 过长，而且旧信息可能噪声很大。所以项目把上下文分层：近期历史保留，旧历史压缩，文件内容沉淀成摘要，相关笔记通过检索召回。这样既保留连续性，又控制 token 成本。
-
-### Q3: 为什么不用向量数据库？
-
-这个项目定位是轻量本地 agent，MVP 阶段优先可解释和可测试。所以 relevant memory 用 tag/关键词/时间排序。后续可以替换成 embedding retrieval，但当前方案足够透明，也方便 benchmark。
-
-### Q4: 怎么保证模型不会乱改文件？
-
-模型不能直接改文件，只能发工具调用。写文件和 shell 都是 risky tool，需要 approval policy。所有路径都经过 workspace root 校验，`patch_file` 要求 old_text 精确命中一次，执行前后还会 snapshot workspace 并记录 diff summary。
-
-### Q5: checkpoint 有什么用？
-
-checkpoint 用来恢复任务现场。它不只是保存一句摘要，还保存当前目标、下一步、关键文件和 hash。恢复时会检查文件是否 stale、runtime 是否 mismatch，避免在上下文已经失效时继续执行。
-
-### Q6: 你怎么测试 agent？模型输出不是不稳定吗？
-
-项目把 runtime 和模型能力解耦，用 FakeModelClient 固定输出，这样可以确定性测试工具协议、上下文拼装、安全边界、状态落盘和恢复机制。benchmark 也是基于 scripted outputs 跑 fixture repo 和 verifier。
-
-## 24. 最核心的一条主线
-
-面试前最后背这条线：
-
-```text
-CLI 构建 Bingo
- ↓
-WorkspaceContext 采集仓库现场
- ↓
-Bingo 初始化 session / memory / tools / prefix
- ↓
-用户 ask
- ↓
-ContextManager 拼 prompt
- ↓
-ModelClient 返回 tool 或 final
- ↓
-runtime parse
- ↓
-run_tool 执行受控工具
- ↓
-history + memory + checkpoint + trace 回写
- ↓
-下一轮继续
- ↓
-final 后写 report
-```
-
-只要能围绕这条线展开，再补上“上下文分层、安全工具层、checkpoint 恢复、benchmark 评测”，这个项目就能讲得完整而且工程味很足。
+如果面试官继续深挖，就沿着“输入如何路由、证据如何产生、动作如何受控、结果如何验证”四条线展开。每个回答都回到具体源码、边界条件和数据，不需要夸大模型能力。

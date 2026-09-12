@@ -105,8 +105,8 @@ class Bingo:
         session=None,
         run_store=None,
         approval_policy="ask",
-        max_steps=6,
-        max_new_tokens=512,
+        max_steps=12,
+        max_new_tokens=2048,
         depth=0,
         max_depth=1,
         read_only=False,
@@ -182,6 +182,7 @@ class Bingo:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self._read_ranges_this_run = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -659,6 +660,8 @@ class Bingo:
             - Use verification_workflow for local verification; it invokes a diagnostic child only when deterministic parsing finds ambiguity.
             - Only the parent Agent may edit source files. Workflow children are read-only.
             - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
+            - When a code location is unknown, use retrieve_code or search before read_file. Read the smallest useful range.
+            - Source ranges already present in the evidence cache must not be read again. Continue from the first uncached line.
             - Before writing tests for existing code, read the implementation first.
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
@@ -1011,6 +1014,25 @@ class Bingo:
         metadata.update(self.detected_secret_env_summary())
         return prompt, metadata
 
+    def render_run_control(self):
+        task_state = getattr(self, "current_task_state", None)
+        used = int(getattr(task_state, "tool_steps", 0) or 0)
+        remaining = max(0, int(self.max_steps) - used)
+        lines = [
+            "Run control:",
+            f"- Tool-call budget: {used} used, {remaining} remaining (maximum {self.max_steps}).",
+            "- Reuse cached source evidence; do not re-read an already covered file range.",
+        ]
+        if remaining <= 2:
+            lines.append(
+                "- Exploration budget is closed. Use the evidence already collected; perform only a necessary edit or verification, or return the final answer."
+            )
+        else:
+            lines.append(
+                "- Locate code with retrieve_code/search, then read only the smallest uncached range needed to act."
+            )
+        return "\n".join(lines)
+
     def emit_trace(self, task_state, event, payload=None):
         payload = self.redact_artifact(payload or {})
         payload["event"] = event
@@ -1143,14 +1165,26 @@ class Bingo:
                 if (match := re.match(r"\s*(\d+):", line))
             ]
             if numbered_lines:
-                self.evidence_cache.store(
+                start_line = min(numbered_lines)
+                end_line = max(numbered_lines)
+                entry = self.evidence_cache.store(
                     canonical_path,
-                    min(numbered_lines),
-                    max(numbered_lines),
+                    start_line,
+                    end_line,
                     result,
                     summary=memorylib.summarize_read_result(result),
                     complete="...[truncated " not in str(result),
                 )
+                if entry:
+                    current_hash = memorylib.file_freshness(canonical_path, self.root)
+                    read_state = self._read_ranges_this_run.setdefault(
+                        canonical_path,
+                        {"file_hash": current_hash, "ranges": []},
+                    )
+                    if read_state.get("file_hash") != current_hash:
+                        read_state["file_hash"] = current_hash
+                        read_state["ranges"] = []
+                    read_state["ranges"].append((start_line, end_line))
         elif name == "read_symbol":
             match = re.match(
                 r"^\[([^:\]]+):(\d+)-(\d+)\].*?sha256=([0-9a-f]{64})\n",
@@ -1170,6 +1204,7 @@ class Bingo:
                 )
         elif name in {"write_file", "patch_file"} and canonical_path:
             self.evidence_cache.invalidate_path(canonical_path)
+            self._read_ranges_this_run.pop(canonical_path, None)
 
         self.session["evidence_cache"] = self.evidence_cache.to_dict()
 
@@ -1283,6 +1318,7 @@ class Bingo:
         这里就是最关键的入口。
         """
         run_started_at = time.monotonic()
+        self._read_ranges_this_run = {}
         skill_route = self.activate_skills(user_message)
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
@@ -1590,6 +1626,21 @@ class Bingo:
                 "diff_summary": [],
             }
             return message
+        if self.exploration_budget_exhausted(name):
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "exploration_budget_reserved",
+                "security_event_type": "",
+                "risk_level": "low",
+                "read_only": True,
+                "affected_paths": [],
+                "workspace_changed": False,
+                "diff_summary": [],
+            }
+            return (
+                "error: repository exploration budget is exhausted; use cached evidence and "
+                "perform the necessary edit or verification, or return a final answer"
+            )
         if self.repeated_tool_call(name, args):
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
@@ -1602,6 +1653,28 @@ class Bingo:
                 "diff_summary": [],
             }
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+
+        effective_args = dict(args)
+        read_cache_action = ""
+        skipped_cached_range = ""
+        if name == "read_file":
+            effective_args, skipped_cached_range, read_cache_action = self.prepare_read_file_args(args)
+            if effective_args is None:
+                self._last_tool_result_metadata = {
+                    "tool_status": "rejected",
+                    "tool_error_code": "source_range_already_cached",
+                    "security_event_type": "",
+                    "risk_level": "low",
+                    "read_only": True,
+                    "affected_paths": [],
+                    "workspace_changed": False,
+                    "diff_summary": [],
+                    "read_cache_action": "reused",
+                }
+                return (
+                    f"error: {skipped_cached_range} is already available in the source evidence cache; "
+                    "use that evidence, inspect a different uncached range, edit, verify, or return a final answer"
+                )
         if tool["risky"] and not self.approve(name, args):
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
@@ -1617,7 +1690,9 @@ class Bingo:
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            raw_result = tool["run"](args)
+            raw_result = tool["run"](effective_args)
+            if skipped_cached_range:
+                raw_result = f"# skipped cached lines {skipped_cached_range}\n{raw_result}"
             # retrieve_code packs complete location cards under its validated 4000-char budget.
             result = raw_result if name == "retrieve_code" else clip(raw_result)
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -1634,7 +1709,7 @@ class Bingo:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
-            self.update_memory_after_tool(name, args, result)
+            self.update_memory_after_tool(name, effective_args, result)
             self._last_tool_result_metadata = {
                 "tool_status": tool_status,
                 "tool_error_code": tool_error_code,
@@ -1646,6 +1721,14 @@ class Bingo:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
+            if name == "read_file":
+                self._last_tool_result_metadata.update(
+                    {
+                        "read_cache_action": read_cache_action or "miss",
+                        "effective_args": effective_args,
+                        "skipped_cached_range": skipped_cached_range,
+                    }
+                )
             if name == "retrieve_code":
                 self._last_tool_result_metadata["retrieval"] = self.retrieval_metadata()
             if name in {"parallel_workflow", "verification_workflow"}:
@@ -1683,6 +1766,65 @@ class Bingo:
             return False
         recent = tool_events[-2:]
         return all(item["name"] == name and item["args"] == args for item in recent)
+
+    def exploration_budget_exhausted(self, name):
+        exploration_tools = {"list_files", "read_file", "read_symbol", "search", "retrieve_code"}
+        task_state = getattr(self, "current_task_state", None)
+        if name not in exploration_tools or task_state is None or int(self.max_steps) < 4:
+            return False
+        used_before_this_call = max(0, int(task_state.tool_steps) - 1)
+        return used_before_this_call >= int(self.max_steps) - 2
+
+    def prepare_read_file_args(self, args):
+        """Skip fresh line ranges that are already present in EvidenceCache."""
+        path = self.path(args["path"])
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if not lines:
+            return dict(args), "", "miss"
+
+        requested_start = int(args.get("start", 1))
+        requested_end = min(int(args.get("end", 200)), len(lines))
+        if requested_start > requested_end:
+            return dict(args), "", "miss"
+
+        canonical_path = self.evidence_cache.canonical_path(args["path"])
+        current_hash = memorylib.file_freshness(canonical_path, self.root)
+        read_state = self._read_ranges_this_run.get(canonical_path, {})
+        if read_state.get("file_hash") != current_hash:
+            self._read_ranges_this_run.pop(canonical_path, None)
+            read_state = {}
+        intervals = sorted(
+            (max(requested_start, int(start)), min(requested_end, int(end)))
+            for start, end in read_state.get("ranges", [])
+            if int(end) >= requested_start and int(start) <= requested_end
+        )
+
+        cursor = requested_start
+        for covered_start, covered_end in intervals:
+            if covered_end < cursor:
+                continue
+            if covered_start > cursor:
+                break
+            cursor = max(cursor, covered_end + 1)
+        if cursor > requested_end:
+            return None, f"{canonical_path}:{requested_start}-{requested_end}", "reused"
+
+        uncovered_end = requested_end
+        for covered_start, covered_end in intervals:
+            if covered_start > cursor:
+                uncovered_end = min(uncovered_end, covered_start - 1)
+                break
+
+        effective_args = dict(args)
+        effective_args["start"] = cursor
+        effective_args["end"] = uncovered_end
+        skipped = f"{requested_start}-{cursor - 1}" if cursor > requested_start else ""
+        cache_action = (
+            "trimmed"
+            if cursor != requested_start or uncovered_end != requested_end
+            else "miss"
+        )
+        return effective_args, skipped, cache_action
 
     @staticmethod
     def new_task_id():

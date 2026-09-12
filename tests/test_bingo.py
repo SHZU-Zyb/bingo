@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -140,6 +141,106 @@ def test_write_invalidates_cached_source_evidence(tmp_path):
     agent.run_tool("write_file", {"path": "sample.txt", "content": "beta\n"})
 
     assert agent.session["evidence_cache"]["entries"] == []
+
+
+def test_overlapping_read_starts_at_first_uncached_line(tmp_path):
+    path = tmp_path / "large.txt"
+    path.write_text(
+        "\n".join(f"line {number}: " + ("x" * 80) for number in range(1, 121)) + "\n",
+        encoding="utf-8",
+    )
+    agent = build_agent(tmp_path, [])
+
+    first = agent.run_tool("read_file", {"path": "large.txt", "start": 1, "end": 120})
+    first_lines = [
+        int(match.group(1))
+        for line in first.splitlines()
+        if (match := re.match(r"\s*(\d+):", line))
+    ]
+    assert first_lines[-1] < 120
+
+    second = agent.run_tool("read_file", {"path": "large.txt", "start": 1, "end": 120})
+    second_lines = [
+        int(match.group(1))
+        for line in second.splitlines()
+        if (match := re.match(r"\s*(\d+):", line))
+    ]
+
+    assert second_lines[0] == first_lines[-1] + 1
+    assert f"skipped cached lines 1-{first_lines[-1]}" in second
+    assert agent._last_tool_result_metadata["read_cache_action"] == "trimmed"
+
+
+def test_read_file_rejects_a_range_already_present_in_evidence_cache(tmp_path):
+    path = tmp_path / "sample.txt"
+    path.write_text("\n".join(f"line {number}" for number in range(1, 41)) + "\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 40})
+
+    result = agent.run_tool("read_file", {"path": "sample.txt", "start": 10, "end": 30})
+
+    assert "already available in the source evidence cache" in result
+    assert agent._last_tool_result_metadata["tool_status"] == "rejected"
+    assert agent._last_tool_result_metadata["tool_error_code"] == "source_range_already_cached"
+
+
+def test_read_dedup_scope_resets_for_a_new_user_request(tmp_path):
+    path = tmp_path / "sample.txt"
+    path.write_text("alpha\nbeta\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":2}}</tool>',
+            "<final>First read complete.</final>",
+            '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":2}}</tool>',
+            "<final>Second read complete.</final>",
+        ],
+    )
+
+    assert agent.ask("Inspect the first time") == "First read complete."
+    assert agent.ask("Inspect again for a new task") == "Second read complete."
+
+    tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert tool_items[-1]["content"].startswith("# sample.txt")
+
+
+def test_file_edit_invalidates_same_run_read_coverage(tmp_path):
+    path = tmp_path / "sample.txt"
+    path.write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+    agent.run_tool("write_file", {"path": "sample.txt", "content": "beta\n"})
+
+    result = agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+
+    assert "beta" in result
+    assert agent._last_tool_result_metadata["tool_status"] == "ok"
+
+
+def test_runtime_reserves_last_step_from_further_repository_exploration(tmp_path):
+    for number in range(1, 6):
+        (tmp_path / f"file{number}.txt").write_text(f"value {number}\n", encoding="utf-8")
+    outputs = [
+        f'<tool>{{"name":"read_file","args":{{"path":"file{number}.txt","start":1,"end":1}}}}</tool>'
+        for number in range(1, 6)
+    ] + ["<final>Finished with the available evidence.</final>"]
+    agent = build_agent(tmp_path, outputs, max_steps=6)
+
+    answer = agent.ask("Inspect the files and finish")
+
+    assert answer == "Finished with the available evidence."
+    tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert "exploration budget is exhausted" in tool_items[-1]["content"]
+    assert not any(entry["path"] == "file5.txt" for entry in agent.session["evidence_cache"]["entries"])
+    assert "Tool-call budget: 4 used, 2 remaining" in agent.model_client.prompts[4]
+
+
+def test_cli_defaults_allow_a_practical_coding_run_budget():
+    args = mini_pkg.build_arg_parser().parse_args([])
+
+    assert args.max_steps == 12
+    assert args.max_new_tokens == 2048
+    assert ConsoleProgressRenderer().max_steps == 12
 
 
 def test_checkpoint_keeps_evidence_references_without_copying_source(tmp_path):

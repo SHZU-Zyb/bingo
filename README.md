@@ -3,7 +3,7 @@
 > 面向真实代码仓库的本地 Coding Agent：自适应代码检索、Symbol Graph、按需 Skill 与有门控的多 Agent Workflow。
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-![Tests](https://img.shields.io/badge/tests-218%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-224%20passed-brightgreen)
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 
@@ -95,7 +95,9 @@ Bingo 坚持以下调度顺序：
 - 子 Agent 工具白名单只能收窄权限；
 - 敏感环境变量在 Trace 和 Report 中统一脱敏；
 - Session、Checkpoint、Trace、Report 持久化；
-- 重复工具调用检测、步骤预算和失败降级。
+- 精确参数与源码行区间两级防重：重叠读取自动续接未缓存行，完全覆盖读取直接拒绝；
+- 12 步默认工具预算、末段探索熔断和 2,048 token 单步输出预算，避免任务在反复浏览中耗尽；
+- Session、Trace 中记录请求范围、实际读取范围、缓存复用和失败降级原因。
 
 ## 系统架构
 
@@ -233,7 +235,7 @@ BINGO_EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 项目虚拟环境中的完整测试结果：
 
 ```text
-218 passed, 2 skipped, 0 failed
+224 passed, 4 skipped, 0 failed
 ```
 
 其中真实仓库评测专项测试为 `6 passed`，Evaluator/Retrieval 相关回归为 `32 passed, 2 skipped`。
@@ -311,7 +313,28 @@ pytest -q
 - [Skill 路由与按需加载](docs/skills.md)
 - [有门控的多 Agent Workflow](docs/workflows.md)
 - [真实仓库评测方法](docs/real-benchmark.md)
+- [项目面试深挖手册](PROJECT_INTERVIEW_SUMMARY.md)
 - [项目简历说明](docs/resume-project-description.md)
+
+## 日常更新到 GitHub
+
+项目已经配置 `origin` 远程仓库。Windows PowerShell 中在项目根目录执行：
+
+```powershell
+.\publish.ps1 "说明这次修改了什么"
+```
+
+脚本会依次检查 `.env` 和常见密钥文件没有被 Git 跟踪、运行完整测试、创建提交并推送当前分支。常用选项：
+
+```powershell
+# 只检查将要发布的文件，不提交、不上传
+.\publish.ps1 "检查" -DryRun
+
+# 已经手动完成测试时跳过测试
+.\publish.ps1 "修复检索重复读取" -SkipTests
+```
+
+如果显示 `No changes to publish`，说明本地没有尚未上传的新修改。推送失败时提交仍保留在本地，处理网络或远程分支冲突后重新运行即可。
 
 ## 当前状态
 

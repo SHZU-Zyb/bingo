@@ -655,6 +655,37 @@ path + start_line + end_line + file_hash + symbol_id
 
 `read_file` 和 `read_symbol` 成功后写入缓存，`write_file` 和 `patch_file` 会按路径立即失效缓存。外部编辑在下一次 Prompt 构建时通过文件哈希发现。Checkpoint 只保存 `evidence_refs`，不复制代码正文。
 
+#### 14.3.1 同一任务内的行区间防重
+
+只比较工具参数无法识别语义重复。例如，先读取 `1-120`，结果因 4000 字符上限只展示到第 78 行，随后再请求整文件或 `40-110`，参数虽然不同，仍会重复返回大量旧内容。
+
+Bingo 在每次顶层请求开始时建立临时读取覆盖表，按 `path + file_hash + line ranges` 记录本任务已经真正展示给模型的行号。新的 `read_file` 请求会先做区间规划：
+
+```text
+已展示：1-78
+请求：  1-120
+实际读：79-120
+
+已展示：1-120
+请求：  40-110
+结果：  拒绝，直接复用现有 Evidence
+```
+
+该机制有四个边界：
+
+1. 只在同一个用户任务内阻止重复读取；新任务可以重新读取，避免旧任务证据没有进入当前 Prompt 时误拒绝。
+2. 文件哈希变化后立即清空该路径的覆盖范围；`write_file`、`patch_file` 和外部编辑都不会复用旧代码。
+3. 被 4000 字符截断的读取只记录实际出现的行号，不把请求但未返回的尾部误判为已读。
+4. Trace 保留模型请求参数，同时记录 `effective_args`、`read_cache_action` 和 `skipped_cached_range`，可以审计模型想读什么以及系统实际读了什么。
+
+这不是用摘要替代源码。首次读取仍返回原文，后续只跳过当前任务中已进入上下文的相同行区间。
+
+#### 14.3.2 步骤预算收尾保护
+
+默认 CLI 预算调整为每个请求 12 个工具步骤、每次模型输出 2048 tokens。每轮 Prompt 都包含一个可压缩的 `Run control` 区域，告诉模型已经使用和剩余的工具次数。当只剩两个工具额度时，运行时关闭 `list_files`、`search`、`retrieve_code`、`read_symbol` 和 `read_file` 等继续探索动作，引导模型使用已有证据进行编辑、验证或返回最终答案。写入与验证工具仍然可用，因此该保护不会把任务锁死在只读阶段。
+
+`Run control` 位于当前请求之前；总上下文过小时优先删除该区域。用户原始请求仍保持完整并位于 Prompt 最后。
+
 ### 14.4 Prompt 顺序和字符预算
 
 默认 Prompt 上限从 12000 字符调整为 48000 字符。各区域使用字符数，避免将项目绑定到某个模型 tokenizer：
@@ -669,6 +700,7 @@ DEFAULT_SECTION_BUDGETS = {
     "retrieval": 2400,
     "source_evidence": 20000,
     "history": 7000,
+    "run_control": 500,
 }
 ```
 
@@ -683,10 +715,11 @@ Recalled Memory（有命中才出现）
 Retrieval Candidates（代码查询才出现）
 Source Evidence（存在新鲜缓存命中才出现）
 Recent History
+Run Control（已用/剩余步骤与收尾约束）
 Current Request
 ```
 
-超预算时依次压缩 Recalled Memory、候选、历史、Source Evidence、Working Memory 和 Prefix。当前请求永不裁剪；候选和 Source Evidence 都按整块装配。若同一读取已经作为 Source Evidence 注入，历史中的对应 `read_file`/`read_symbol` 结果会被删除。
+超预算时先删除可重新生成的 Run Control，再依次压缩 Recalled Memory、候选、历史、Source Evidence、Working Memory 和 Prefix。当前请求永不裁剪；候选和 Source Evidence 都按整块装配。若同一读取已经作为 Source Evidence 注入，历史中的对应 `read_file`/`read_symbol` 结果会被删除。
 
 ### 14.5 检索工具自身预算
 

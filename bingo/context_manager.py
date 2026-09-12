@@ -19,6 +19,7 @@ DEFAULT_SECTION_BUDGETS = {
     "memory": 1800,
     "relevant_memory": 1200,
     "history": 7000,
+    "run_control": 500,
 }
 DEFAULT_SECTION_FLOORS = {
     "prefix": 1200,
@@ -27,9 +28,11 @@ DEFAULT_SECTION_FLOORS = {
     "memory": 400,
     "relevant_memory": 300,
     "history": 1500,
+    "run_control": 0,
 }
 # 当 prompt 超预算时，会优先压缩这些 section。
 DEFAULT_REDUCTION_ORDER = (
+    "run_control",
     "skill_catalog",
     "relevant_memory",
     "retrieval",
@@ -45,6 +48,7 @@ SECTION_ORDER = (
     "memory",
     "relevant_memory",
     "history",
+    "run_control",
     "current_request",
 )
 CURRENT_REQUEST_SECTION = "current_request"
@@ -94,7 +98,13 @@ class ContextManager:
         self._source_evidence = []
         self._stale_evidence_invalidations = []
         if getattr(agent, "auto_retrieve", False):
-            self.section_order = (*SECTION_ORDER[:-2], "retrieval", "source_evidence", *SECTION_ORDER[-2:])
+            history_index = SECTION_ORDER.index("history")
+            self.section_order = (
+                *SECTION_ORDER[:history_index],
+                "retrieval",
+                "source_evidence",
+                *SECTION_ORDER[history_index:],
+            )
         self.total_budget = int(total_budget)
         self.section_budgets = dict(DEFAULT_SECTION_BUDGETS)
         if section_budgets:
@@ -102,7 +112,10 @@ class ContextManager:
         if getattr(agent, "auto_retrieve", False):
             self.section_budgets["retrieval"] = 2400
             self.section_budgets["source_evidence"] = 20000
-        self._section_floor_overrides = {str(key): int(value) for key, value in (section_floors or {}).items()}
+        self._section_floor_overrides = {"run_control": 0}
+        self._section_floor_overrides.update(
+            {str(key): int(value) for key, value in (section_floors or {}).items()}
+        )
         self.section_floors = self._compute_section_floors()
         self.reduction_order = tuple(reduction_order or DEFAULT_REDUCTION_ORDER)
         if getattr(agent, "auto_retrieve", False):
@@ -151,6 +164,9 @@ class ContextManager:
                 else str(self.agent.memory_text())
             ),
             "history": "",
+            "run_control": str(self.agent.render_run_control())
+            if hasattr(self.agent, "render_run_control")
+            else "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
         checkpoint_text = ""
@@ -301,6 +317,12 @@ class ContextManager:
                 },
             ),
             "history": SectionRender(raw=history_raw, budget=len(history_raw), rendered=history_raw, details={"rendered_entries": []}),
+            "run_control": SectionRender(
+                raw=section_texts["run_control"],
+                budget=len(section_texts["run_control"]),
+                rendered=section_texts["run_control"],
+                details={},
+            ),
             CURRENT_REQUEST_SECTION: SectionRender(
                 raw=section_texts[CURRENT_REQUEST_SECTION],
                 budget=0,

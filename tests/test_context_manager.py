@@ -42,6 +42,7 @@ def test_context_manager_assembles_sections_in_expected_order(tmp_path):
         "memory",
         "relevant_memory",
         "history",
+        "run_control",
         "current_request",
     ]
 
@@ -85,7 +86,8 @@ def test_context_manager_reduces_relevant_memory_before_history_and_preserves_ne
         assert metadata["sections"][section]["rendered_chars"] <= metadata["sections"][section]["budget_chars"]
 
     reduction_sections = [entry["section"] for entry in metadata["budget_reductions"]]
-    assert reduction_sections[0] == "relevant_memory"
+    assert reduction_sections[0] == "run_control"
+    assert "relevant_memory" in reduction_sections
     assert reduction_sections
     assert "RECENT-CONTEXT" in prompt
     assert "OLD-CONTEXT" not in prompt
@@ -293,6 +295,10 @@ def test_context_manager_separates_candidates_cached_source_and_recalled_memory(
     assert "Retrieved code locations" in prompt
     assert "Cached source evidence" in prompt
     assert source.strip() in prompt.replace("   1: ", "").replace("   2: ", "")
+    assert prompt.index("Retrieved code locations") < prompt.index("Cached source evidence")
+    assert prompt.index("Cached source evidence") < prompt.index("Transcript:")
+    assert prompt.index("Transcript:") < prompt.index("Run control:")
+    assert prompt.index("Run control:") < prompt.index("Current user request:")
     assert metadata["context_route"]["intent"] == "mixed"
     assert metadata["retrieval_candidates"]["rendered_chars"] > 0
     assert metadata["source_evidence"]["cache_hits"] == 1
